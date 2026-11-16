@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail instead of skipping guests whose toolchain is missing.
+  WASM_CORE_REQUIRE_ALL_GUESTS: "1"
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2, wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: guests/javascript/package-lock.json
+      - name: Install JavaScript guest toolchain
+        run: npm ci
+        working-directory: guests/javascript
+      - run: cargo test --workspace
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Docs
+        run: cargo doc -p wasm-backend-core --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  features:
+    name: Feature combinations
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check -p wasm-backend-core --no-default-features
+      - run: cargo check -p wasm-backend-core --no-default-features --features component
+      - run: cargo check -p wasm-backend-core --no-default-features --features extism
+      - run: cargo check -p wasm-backend-core --no-default-features --features hot-reload
+      - run: cargo check -p wasm-backend-core --all-features
