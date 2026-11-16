@@ -26,7 +26,7 @@ every host built on this core:
 
 ```toml
 [dependencies]
-wasm-backend-core = { git = "https://github.com/SurajSSingh/rust-wasm-core-interchange" }
+wasm-backend-core = { git = "https://github.com/AJayClauGermany/rust-wasm-core-interchange" }
 ```
 
 Cargo features (all but `specta` are on by default): `component` (WIT engine,

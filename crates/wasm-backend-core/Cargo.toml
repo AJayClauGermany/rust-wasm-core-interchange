@@ -5,7 +5,7 @@ license = "Apache-2.0 WITH LLVM-exception"
 description = "Framework-agnostic core of tauri-plugin-wasm-backend: hot-reloadable, capability-restricted WebAssembly backend modules (WIT components or Extism plugins) for any Rust app."
 edition = "2024"
 rust-version = "1.90"
-repository = "https://github.com/SurajSSingh/rust-wasm-core-interchange"
+repository = "https://github.com/AJayClauGermany/rust-wasm-core-interchange"
 # The integration tests use guest fixtures from the repository.
 exclude = ["/tests"]
 
