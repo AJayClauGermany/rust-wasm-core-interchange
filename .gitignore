@@ -1,0 +1,11 @@
+/target
+Cargo.lock
+node_modules/
+.DS_Store
+.idea/
+.vscode/settings.json
+
+# Guest build outputs
+/guests/*/*/target
+/guests/*/*/wit/deps
+/guests/*/*/Cargo.lock
