@@ -35,6 +35,7 @@ pub(crate) struct ExtismInstance {
     plugin: extism::Plugin,
     host: Arc<ModuleHost>,
     exports: Vec<String>,
+    traps: u64,
 }
 
 impl ExtismInstance {
@@ -81,6 +82,7 @@ impl ExtismInstance {
             plugin,
             host,
             exports,
+            traps: 0,
         })
     }
 
@@ -91,24 +93,27 @@ impl ExtismInstance {
     }
 
     fn call_raw(&mut self, function: &str, input: &str) -> Result<Vec<u8>> {
-        self.plugin
-            .call::<&str, Vec<u8>>(function, input)
-            .map_err(|e| {
-                let msg = e.to_string();
-                let trapped = e
-                    .chain()
-                    .any(|c| c.downcast_ref::<wasmtime::Trap>().is_some());
-                if trapped || msg == "timeout" || msg == "oom" {
-                    let msg = if msg == "timeout" {
-                        "call timed out".to_string()
-                    } else {
-                        format!("{e:#}")
-                    };
-                    return Error::Runtime(msg);
-                }
-                // Plugin-set errors are usually strings; pass JSON through as is.
-                Error::Command(serde_json::from_str(&msg).unwrap_or(Value::String(msg)))
-            })
+        let e = match self.plugin.call::<&str, Vec<u8>>(function, input) {
+            Ok(out) => return Ok(out),
+            Err(e) => e,
+        };
+        let msg = e.to_string();
+        let trapped = e
+            .chain()
+            .any(|c| c.downcast_ref::<wasmtime::Trap>().is_some());
+        if trapped || msg == "timeout" || msg == "oom" {
+            self.traps += 1;
+            let msg = if msg == "timeout" {
+                "call timed out".to_string()
+            } else {
+                format!("{e:#}")
+            };
+            return Err(Error::Runtime(msg));
+        }
+        // Plugin-set errors are usually strings; pass JSON through as is.
+        Err(Error::Command(
+            serde_json::from_str(&msg).unwrap_or(Value::String(msg)),
+        ))
     }
 }
 
@@ -119,6 +124,10 @@ fn is_internal_export(name: &str) -> bool {
 }
 
 impl ModuleInstance for ExtismInstance {
+    fn traps(&self) -> u64 {
+        self.traps
+    }
+
     fn call(&mut self, command: &str, args: Value) -> Result<Value> {
         let function = self
             .resolve(command)
@@ -286,22 +295,7 @@ fn tauri_invoke(
 
 /// Names of the functions exported by a core WebAssembly module.
 fn core_function_exports(bytes: &[u8]) -> Vec<String> {
-    fn leb(bytes: &[u8], pos: &mut usize) -> Option<u64> {
-        let mut result = 0u64;
-        let mut shift = 0;
-        loop {
-            let b = *bytes.get(*pos)?;
-            *pos += 1;
-            result |= ((b & 0x7f) as u64) << shift;
-            if b & 0x80 == 0 {
-                return Some(result);
-            }
-            shift += 7;
-            if shift > 63 {
-                return None;
-            }
-        }
-    }
+    use super::leb;
     fn parse(bytes: &[u8]) -> Option<Vec<String>> {
         let mut pos = 8;
         while pos < bytes.len() {

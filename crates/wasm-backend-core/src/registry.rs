@@ -5,7 +5,6 @@ use std::{
     cell::RefCell,
     collections::BTreeMap,
     fmt::Display,
-    hash::{DefaultHasher, Hash, Hasher},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock, Weak},
     time::SystemTime,
@@ -31,6 +30,34 @@ pub const EVENT_MODULE_RELOADED: &str = "wasm-backend://module-reloaded";
 pub const EVENT_MODULE_UNLOADED: &str = "wasm-backend://module-unloaded";
 /// Emitted with a [`ModuleError`] payload when loading or reloading fails.
 pub const EVENT_MODULE_ERROR: &str = "wasm-backend://module-error";
+/// Emitted with a [`ModuleTrap`] payload when a call into a module traps (a
+/// panic, a timeout, running out of memory).
+pub const EVENT_MODULE_TRAPPED: &str = "wasm-backend://module-trapped";
+
+/// Decides whether a module may be loaded. Set with
+/// [`BackendBuilder::load_gate`].
+pub type LoadGate<P> =
+    Arc<dyn Fn(&P, &LoadRequest<'_>) -> std::result::Result<(), String> + Send + Sync>;
+
+/// A module about to be loaded or reloaded, as shown to the
+/// [`BackendBuilder::load_gate`] before any of its code is compiled or run.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct LoadRequest<'a> {
+    /// Name the module is loaded under.
+    pub name: &'a str,
+    /// File it is loaded from (`None` for embedded bytes).
+    pub path: Option<&'a Path>,
+    /// Whether it comes from the external plugins directory.
+    pub external: bool,
+    /// SHA-256 of the module's bytes, in lowercase hex. Compare it with a
+    /// list of known plugins, or show it to the user.
+    pub sha256: &'a str,
+    /// What the module would be allowed to do.
+    pub capabilities: &'a Capabilities,
+    /// Whether this replaces a loaded module after its file changed.
+    pub reload: bool,
+}
 
 /// A host command working on JSON values. Build one from a typed closure
 /// with [`host_command_fn`].
@@ -99,6 +126,22 @@ pub struct ModuleInfo {
     pub watched: bool,
     /// Incremented on every reload.
     pub generation: u64,
+    /// SHA-256 of the module's bytes, in lowercase hex.
+    #[serde(default)]
+    pub sha256: String,
+    /// Every interface the module imports, as it names them (e.g.
+    /// `wasi:filesystem/types@0.2.6`; WIT modules only): all it can reach
+    /// outside its own memory. A module importing nothing can only compute.
+    #[serde(default)]
+    pub requires: Vec<String>,
+    /// Calls that trapped since the module was last (re)loaded. After each
+    /// one the module started again from fresh memory.
+    #[serde(default)]
+    pub traps: u32,
+    /// Whether the module trapped more often than its `maxRestarts`
+    /// capability allows. Every call fails until it is reloaded.
+    #[serde(default)]
+    pub stopped: bool,
     pub commands: Vec<CommandInfo>,
     /// Host commands the module imports as typed WIT functions, named as
     /// registered. Each one was checked when the module loaded: it exists
@@ -122,12 +165,24 @@ pub struct ModuleError {
     pub error: String,
 }
 
+/// Payload of [`EVENT_MODULE_TRAPPED`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[serde(rename_all = "camelCase")]
+pub struct ModuleTrap {
+    pub module: String,
+    pub error: String,
+    /// Traps since the module was last (re)loaded, this one included.
+    pub traps: u32,
+    /// Whether this trap stopped the module (see [`ModuleInfo::stopped`]).
+    pub stopped: bool,
+}
+
 /// Metadata, kept apart from the instance so that reading it never waits
 /// for (or deadlocks with) a running call.
 struct Meta {
     info: ModuleInfo,
     typescript: String,
-    hash: u64,
 }
 
 pub(crate) struct Module<P: Platform> {
@@ -184,6 +239,7 @@ pub(crate) struct Inner<P: Platform> {
     pub(crate) external: Option<External>,
     typescript_dir: Option<PathBuf>,
     typescript: TypeScriptOptions,
+    load_gate: Option<LoadGate<P>>,
     /// Modules that failed to load from a file; retried when it changes.
     pub(crate) pending: Mutex<BTreeMap<String, (ModuleConfig, PathBuf, bool)>>,
     #[cfg(feature = "hot-reload")]
@@ -340,10 +396,16 @@ fn quoted_list(items: &[impl AsRef<str>]) -> String {
         .join(", ")
 }
 
-fn hash(bytes: &[u8]) -> u64 {
-    let mut h = DefaultHasher::new();
-    bytes.hash(&mut h);
-    h.finish()
+/// The SHA-256 of `bytes`, in lowercase hex.
+fn sha256(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    use std::fmt::Write;
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
 }
 
 /// Configures a [`Backend`].
@@ -355,6 +417,7 @@ pub struct BackendBuilder<P: Platform> {
     external: Option<ExternalConfig>,
     typescript_dir: Option<PathBuf>,
     typescript: TypeScriptOptions,
+    load_gate: Option<LoadGate<P>>,
 }
 
 impl<P: Platform> BackendBuilder<P> {
@@ -415,6 +478,25 @@ impl<P: Platform> BackendBuilder<P> {
         self
     }
 
+    /// Ask `gate` before any module is loaded or reloaded. It sees what is
+    /// about to run (see [`LoadRequest`]) before a byte of it is compiled;
+    /// returning `Err(reason)` refuses the load, which fails with
+    /// [`Error::NotAllowed`] (and a refused reload keeps the previous
+    /// version running).
+    ///
+    /// Use it to decide which third-party plugins run: check
+    /// [`LoadRequest::sha256`] against a list the user approved, say. The
+    /// same file may be asked about again (it is retried when the plugins
+    /// directory changes), so remember the answer rather than asking the
+    /// user twice.
+    pub fn load_gate<F>(mut self, gate: F) -> Self
+    where
+        F: Fn(&P, &LoadRequest<'_>) -> std::result::Result<(), String> + Send + Sync + 'static,
+    {
+        self.load_gate = Some(Arc::new(gate));
+        self
+    }
+
     /// Create the backend. No module is loaded yet: call
     /// [`Backend::load_all`] (or [`Backend::load`]) next. Splitting the two
     /// lets an integration publish the backend (e.g. as app state) before
@@ -446,6 +528,7 @@ impl<P: Platform> BackendBuilder<P> {
             external,
             typescript_dir: self.typescript_dir,
             typescript: self.typescript,
+            load_gate: self.load_gate,
             pending: Mutex::new(BTreeMap::new()),
             #[cfg(feature = "hot-reload")]
             watcher: Mutex::new(None),
@@ -463,6 +546,7 @@ impl<P: Platform> Backend<P> {
             external: None,
             typescript_dir: None,
             typescript: TypeScriptOptions::default(),
+            load_gate: None,
         }
     }
 
@@ -494,8 +578,62 @@ impl<P: Platform> Backend<P> {
     /// [`Backend::invoke_async`].
     pub fn invoke(&self, module: &str, command: &str, args: Value) -> Result<Value> {
         let m = self.get(module)?;
-        let _guard = CallGuard::enter(module)?;
-        m.instance().call(command, args)
+        self.run(&m, |instance| instance.call(command, args))
+    }
+
+    /// Run one call into a module, unless it was stopped, and count the
+    /// trap if it ends in one.
+    fn run<T>(
+        &self,
+        m: &Module<P>,
+        call: impl FnOnce(&mut dyn ModuleInstance) -> Result<T>,
+    ) -> Result<T> {
+        let _guard = CallGuard::enter(&m.name)?;
+        let mut instance = m.instance();
+        {
+            let meta = m.meta();
+            if meta.info.stopped {
+                return Err(Error::Stopped {
+                    module: m.name.clone(),
+                    traps: meta.info.traps,
+                });
+            }
+        }
+        let before = instance.traps();
+        let result = call(instance.as_mut());
+        let trapped = instance.traps() != before;
+        // Counted before the next call can start, so the one after the last
+        // allowed restart never runs.
+        let trap = match &result {
+            Err(error) if trapped => {
+                let mut meta = m.meta.write().unwrap_or_else(|e| e.into_inner());
+                meta.info.traps = meta.info.traps.saturating_add(1);
+                meta.info.stopped = m
+                    .config
+                    .capabilities
+                    .max_restarts
+                    .is_some_and(|max| meta.info.traps > max);
+                Some(ModuleTrap {
+                    module: m.name.clone(),
+                    error: error.to_string(),
+                    traps: meta.info.traps,
+                    stopped: meta.info.stopped,
+                })
+            }
+            _ => None,
+        };
+        drop(instance);
+        if let Some(trap) = trap {
+            if trap.stopped {
+                log::error!(
+                    "WASM module `{}` was stopped after trapping {} times; reload it to start it again",
+                    trap.module,
+                    trap.traps
+                );
+            }
+            self.emit_lifecycle(EVENT_MODULE_TRAPPED, &trap);
+        }
+        result
     }
 
     /// [`Backend::invoke`] on a blocking thread, via
@@ -536,8 +674,7 @@ impl<P: Platform> Backend<P> {
     /// its `events.listen` subscriptions.
     pub fn send_event(&self, module: &str, event: &str, payload: &Value) -> Result<()> {
         let m = self.get(module)?;
-        let _guard = CallGuard::enter(module)?;
-        m.instance().on_event(event, payload)
+        self.run(&m, |instance| instance.on_event(event, payload))
     }
 
     /// Information about every loaded module.
@@ -609,7 +746,8 @@ impl<P: Platform> Backend<P> {
     }
 
     /// Reload a module from its file, even if the file is unchanged (which
-    /// resets the module's state). Blocks while the module compiles.
+    /// resets the module's state, and starts a stopped module again). Blocks
+    /// while the module compiles.
     pub fn reload(&self, name: &str) -> Result<ModuleInfo> {
         let m = self.get(name)?;
         let result = self
@@ -633,14 +771,25 @@ impl<P: Platform> Backend<P> {
             )));
         };
         let bytes = std::fs::read(path)?;
-        let new_hash = hash(&bytes);
-        if only_if_changed && m.meta().hash == new_hash {
+        let new_hash = sha256(&bytes);
+        if only_if_changed && m.meta().info.sha256 == new_hash {
             return Ok(None);
         }
         // Compile and instantiate outside the lock so calls keep being served
         // by the old instance meanwhile.
         let started = SystemTime::now();
-        let (instance, kind) = self.instantiate(&m.name, &m.config, &bytes)?;
+        let (instance, kind) = self.instantiate(
+            &LoadRequest {
+                name: &m.name,
+                path: Some(path),
+                external: m.external,
+                sha256: &new_hash,
+                capabilities: &m.config.capabilities,
+                reload: true,
+            },
+            &m.config,
+            &bytes,
+        )?;
         let _guard = CallGuard::enter(&m.name)?;
         // The module may have been unloaded or replaced while compiling.
         let current = self.get(&m.name)?;
@@ -649,6 +798,7 @@ impl<P: Platform> Backend<P> {
         }
         let commands = instance.commands();
         let imports = instance.imports();
+        let requires = instance.requires();
         let warnings = self.lint(&m.name, &m.config.capabilities, instance.as_ref());
         let typescript = instance.typescript(&m.name).unwrap_or_default();
         *m.instance() = instance;
@@ -656,11 +806,14 @@ impl<P: Platform> Backend<P> {
             let mut meta = m.meta.write().unwrap_or_else(|e| e.into_inner());
             meta.info.commands = commands;
             meta.info.imports = imports;
+            meta.info.requires = requires;
+            meta.info.traps = 0;
+            meta.info.stopped = false;
             meta.info.warnings = warnings;
             meta.info.engine = kind;
             meta.info.generation += 1;
             meta.typescript = typescript;
-            meta.hash = new_hash;
+            meta.info.sha256 = new_hash;
             meta.info.clone()
         };
         log::info!(
@@ -742,12 +895,22 @@ impl<P: Platform> Backend<P> {
         warnings
     }
 
+    /// Ask the load gate, then compile and instantiate the module.
     fn instantiate(
         &self,
-        name: &str,
+        request: &LoadRequest<'_>,
         config: &ModuleConfig,
         bytes: &[u8],
     ) -> Result<(Box<dyn ModuleInstance>, EngineKind)> {
+        let name = request.name;
+        if let Some(gate) = &self.0.load_gate {
+            gate(&self.0.platform, request).map_err(|reason| {
+                Error::NotAllowed(format!(
+                    "loading WASM module `{name}` (sha256 {}) was refused: {reason}",
+                    request.sha256
+                ))
+            })?;
+        }
         let kind = engine::detect(bytes, config.engine);
         let host = Arc::new(ModuleHost {
             module: name.to_string(),
@@ -854,7 +1017,19 @@ impl<P: Platform> Backend<P> {
             };
 
         let started = SystemTime::now();
-        let (instance, kind) = self.instantiate(name, &config, &bytes)?;
+        let hash = sha256(&bytes);
+        let (instance, kind) = self.instantiate(
+            &LoadRequest {
+                name,
+                path: path.as_deref(),
+                external,
+                sha256: &hash,
+                capabilities: &config.capabilities,
+                reload: false,
+            },
+            &config,
+            &bytes,
+        )?;
         let watched = path.is_some() && config.watch.unwrap_or(self.0.hot_reload);
         let warnings = self.lint(name, &config.capabilities, instance.as_ref());
         let info = ModuleInfo {
@@ -865,6 +1040,10 @@ impl<P: Platform> Backend<P> {
             exposed: config.expose.unwrap_or(!external),
             watched,
             generation: 0,
+            sha256: hash,
+            requires: instance.requires(),
+            traps: 0,
+            stopped: false,
             commands: instance.commands(),
             imports: instance.imports(),
             capabilities: config.capabilities.clone(),
@@ -877,7 +1056,6 @@ impl<P: Platform> Backend<P> {
             meta: RwLock::new(Meta {
                 info: info.clone(),
                 typescript: instance.typescript(name).unwrap_or_default(),
-                hash: hash(&bytes),
             }),
             instance: Mutex::new(instance),
             listeners: Mutex::new(Vec::new()),

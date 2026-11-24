@@ -27,6 +27,10 @@ pub enum Error {
     /// output.
     #[error("WASM runtime error: {0}")]
     Runtime(String),
+    /// The module trapped more often than its `maxRestarts` capability
+    /// allows and stays stopped until it is reloaded.
+    #[error("WASM module `{module}` was stopped after trapping {traps} times and must be reloaded")]
+    Stopped { module: String, traps: u32 },
     #[error("{0}")]
     NotAllowed(String),
     #[error(

@@ -33,6 +33,14 @@ pub struct Capabilities {
     /// Maximum wall-clock time for a single call, in milliseconds.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    /// How many times the module is started again after a call traps (a
+    /// panic, a timeout, running out of memory). The trap after the last
+    /// restart stops the module: every call fails with
+    /// [`Error::Stopped`](crate::Error::Stopped) until it is reloaded.
+    /// Counted from when the module was last (re)loaded. Unlimited when
+    /// unset.
+    #[serde(default)]
+    pub max_restarts: Option<u32>,
 }
 
 /// Event related capabilities.
@@ -113,6 +121,13 @@ impl Capabilities {
 
     pub fn memory_limit_mb(mut self, mb: u32) -> Self {
         self.memory_limit_mb = Some(mb);
+        self
+    }
+
+    /// Stop the module once it has trapped more than `restarts` times since
+    /// it was (re)loaded, instead of starting it again forever.
+    pub fn max_restarts(mut self, restarts: u32) -> Self {
+        self.max_restarts = Some(restarts);
         self
     }
 

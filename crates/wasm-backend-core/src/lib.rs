@@ -11,6 +11,9 @@
 //!
 //! - **WIT components** (`component` feature), run by wasmtime. Exported
 //!   functions are commands; arguments are mapped by parameter name.
+//!   A core module built against a WIT world (`wit-bindgen` on
+//!   `wasm32-unknown-unknown`) is wrapped into a component when it loads,
+//!   and runs without any WASI interface.
 //! - **Extism plugins** (`extism` feature), for toolchains that don't target
 //!   the component model yet. Exported functions are commands taking and
 //!   returning JSON.
@@ -99,8 +102,8 @@ pub use error::{Error, Result};
 pub use platform::{BaseDir, EventBus, EventHandler, Platform, resolve_dir};
 pub use registry::{
     Backend, BackendBuilder, EVENT_MODULE_ERROR, EVENT_MODULE_LOADED, EVENT_MODULE_RELOADED,
-    EVENT_MODULE_UNLOADED, HostCall, HostCommandFn, ModuleError, ModuleInfo, TypeScriptOptions,
-    host_command_fn,
+    EVENT_MODULE_TRAPPED, EVENT_MODULE_UNLOADED, HostCall, HostCommandFn, LoadGate, LoadRequest,
+    ModuleError, ModuleInfo, ModuleTrap, TypeScriptOptions, host_command_fn,
 };
 
 /// The WIT package modules import (`tauri:backend`), for tools that need to
