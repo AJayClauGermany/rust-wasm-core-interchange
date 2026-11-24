@@ -5,9 +5,10 @@ Guest modules the core's integration tests build and run, grouped by language:
 
 | Guest                                         | Language   | Engine         | Covers                                                    |
 |-----------------------------------------------|------------|----------------|-----------------------------------------------------------|
-| [`rust/component-guest`](rust/component-guest) | Rust       | WIT component  | Every part of the host API, state, traps, events          |
+| [`rust/component-guest`](rust/component-guest) | Rust       | WIT component  | Every part of the host API, the state store, traps, events |
 | [`rust/typed-guest`](rust/typed-guest)         | Rust       | WIT component  | Host commands imported as typed functions                 |
-| [`rust/extism-guest`](rust/extism-guest)       | Rust       | Extism         | The `tauri_*` host functions, JSON commands               |
+| [`rust/bare-guest`](rust/bare-guest)           | Rust       | WIT component  | Built for `wasm32-unknown-unknown`: no WASI, wrapped at load |
+| [`rust/extism-guest`](rust/extism-guest)       | Rust       | Extism         | The `tauri_*` host functions, state store, JSON commands |
 | [`javascript/greeter`](javascript/greeter)     | JavaScript | WIT component  | componentize-qjs output: records, `result`, events, state |
 
 WIT guests include the host's package with

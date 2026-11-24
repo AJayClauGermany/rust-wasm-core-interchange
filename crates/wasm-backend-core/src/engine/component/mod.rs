@@ -5,6 +5,11 @@
 //! (invoked as `interface.function`). Arguments are matched to parameters by
 //! name, so `invoke('greet', { name })` calls `greet: func(name: string)`,
 //! exactly like Tauri maps invoke arguments to Rust command parameters.
+//!
+//! A core module that carries component type information (what a crate using
+//! `wit-bindgen` builds to for `wasm32-unknown-unknown`) is wrapped into a
+//! component when it loads. Such a module has no WASI imports at all: the
+//! host interfaces it names are everything it can reach.
 
 mod convert;
 mod imports;
@@ -34,11 +39,12 @@ use crate::{Error, Result};
 mod bindings {
     wasmtime::component::bindgen!({
         path: "wit/backend.wit",
-        world: "module",
+        world: "host-imports",
     });
 }
 
 use bindings::tauri::backend::host::{self as host_iface, LogLevel};
+use bindings::tauri::backend::state as state_iface;
 
 const EVENTS_INTERFACE: &str = "tauri:backend/events";
 /// Granularity of call timeouts.
@@ -78,6 +84,24 @@ impl host_iface::Host for State {
 
     fn invoke(&mut self, command: String, args: String) -> std::result::Result<String, String> {
         self.host.invoke(&command, &args)
+    }
+}
+
+impl state_iface::Host for State {
+    fn get(&mut self, key: String) -> std::result::Result<Option<String>, String> {
+        self.host.state_get(&key)
+    }
+
+    fn set(&mut self, key: String, value: String) -> std::result::Result<(), String> {
+        self.host.state_set(&key, value)
+    }
+
+    fn remove(&mut self, key: String) -> std::result::Result<(), String> {
+        self.host.state_remove(&key)
+    }
+
+    fn keys(&mut self) -> std::result::Result<Vec<String>, String> {
+        self.host.state_keys()
     }
 }
 
@@ -137,6 +161,8 @@ fn runtime() -> Result<&'static Runtime> {
             let mut linker = Linker::new(&engine);
             wasmtime_wasi::p2::add_to_linker_sync(&mut linker).map_err(|e| e.to_string())?;
             host_iface::add_to_linker::<State, HasSelf<State>>(&mut linker, |s| s)
+                .map_err(|e| e.to_string())?;
+            state_iface::add_to_linker::<State, HasSelf<State>>(&mut linker, |s| s)
                 .map_err(|e| e.to_string())?;
             Ok(Runtime {
                 engine,
@@ -202,6 +228,22 @@ pub(crate) struct ComponentInstance {
     commands: Vec<Command>,
     on_event: Option<ComponentExportIndex>,
     imports: Vec<CommandInfo>,
+    /// Every interface (and world-level function) the component imports.
+    requires: Vec<String>,
+    traps: u64,
+}
+
+/// Wrap a core module carrying component type information into a component.
+fn wrap(bytes: &[u8]) -> std::result::Result<Vec<u8>, String> {
+    wit_component::ComponentEncoder::default()
+        .validate(true)
+        .module(bytes)
+        .and_then(|encoder| encoder.encode())
+        .map_err(|e| {
+            format!(
+                "it is a core module that can't be made into a component ({e:#}); build it against a WIT world, or load it with the Extism engine"
+            )
+        })
 }
 
 impl ComponentInstance {
@@ -211,7 +253,21 @@ impl ComponentInstance {
             module: host.module.clone(),
             message: format!("{e:#}"),
         };
-        let component = Component::new(&runtime.engine, bytes).map_err(load_err)?;
+        let component = if super::is_component(bytes) {
+            Component::new(&runtime.engine, bytes)
+        } else {
+            let wrapped = wrap(bytes).map_err(|message| Error::Load {
+                module: host.module.clone(),
+                message,
+            })?;
+            Component::new(&runtime.engine, &wrapped)
+        }
+        .map_err(load_err)?;
+        let requires = component
+            .component_type()
+            .imports(&runtime.engine)
+            .map(|(name, _)| name.to_string())
+            .collect();
         let host_imports =
             imports::resolve(&runtime.engine, &component, &host).map_err(|problems| {
                 Error::Load {
@@ -243,6 +299,8 @@ impl ComponentInstance {
             commands,
             on_event,
             imports: host_imports.into_iter().map(|i| i.info).collect(),
+            requires,
+            traps: 0,
         };
         this.instantiate().map_err(|e| Error::Load {
             module: this.host.module.clone(),
@@ -303,6 +361,7 @@ impl ComponentInstance {
         if let Err(e) = result {
             // The instance may be left in an inconsistent state; start over
             // on the next call.
+            self.traps += 1;
             self.instance = None;
             self.store = new_store(self.runtime, &self.host)?;
             return Err(Error::Runtime(trap_message(e)));
@@ -509,6 +568,18 @@ impl ModuleInstance for ComponentInstance {
 
     fn imports(&self) -> Vec<CommandInfo> {
         self.imports.clone()
+    }
+
+    fn requires(&self) -> Vec<String> {
+        self.requires.clone()
+    }
+
+    fn traps(&self) -> u64 {
+        self.traps
+    }
+
+    fn host(&self) -> &ModuleHost {
+        &self.host
     }
 
     fn typescript(&self, module: &str) -> Option<String> {

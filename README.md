@@ -57,6 +57,39 @@ for a complete `Platform` implementation, and
 [`tests/common`](crates/wasm-backend-core/tests/common/mod.rs) for a minimal
 one.
 
+### Running code you didn't write
+
+A few things the runtime does around a module's own code, for hosts that load
+third-party plugins:
+
+- **A load gate.** `BackendBuilder::load_gate` is asked before any module is
+  loaded or reloaded, with its name, path, capabilities and the SHA-256 of
+  its bytes (`LoadRequest`), before a byte of it is compiled. Returning
+  `Err(reason)` refuses the load. `ModuleInfo::sha256` carries the same hash
+  afterwards.
+- **Declared imports.** `ModuleInfo::requires` lists every interface a WIT
+  module imports: all it can reach outside its own memory.
+- **Restart limits.** A call that traps (a panic, a timeout, running out of
+  memory) resets the module's memory and emits
+  `wasm-backend://module-trapped`. With `Capabilities::max_restarts(n)`, the
+  trap after the n-th restart stops the module: calls fail with
+  `Error::Stopped` until it is reloaded. `ModuleInfo::traps` and `stopped`
+  say where it stands.
+- **A state store per module.** A module's memory is reset when it is
+  reloaded or traps. What it stores through the `tauri:backend/state`
+  interface (`tauri_state_*` for Extism) is kept by the host instead, behind
+  the `state` capability (key patterns, e.g. `Capabilities::allow_state("*")`).
+  Writes made during a call are kept when it returns and dropped if it traps.
+  `BackendBuilder::state_store(FileStateStore::new(dir))` keeps state between
+  runs of the app (or implement `StateStore`); `Backend::state` and
+  `clear_state` read and wipe a module's store.
+- **WIT guests without WASI.** A core module built against a WIT world (a
+  Rust crate using `wit-bindgen`, built for `wasm32-unknown-unknown`) is
+  detected by its `component-type` section and wrapped into a component when
+  it loads. It imports no `wasi:*` interface at all, so `tauri:backend/host`
+  and the host commands it imports are everything it can reach; see
+  [`guests/rust/bare-guest`](guests/rust/bare-guest).
+
 The guest API (the `tauri:backend` WIT package and the `tauri_*` Extism host
 functions) is the same on every host. Access control for *callers* of
 `Backend::invoke` (e.g. Tauri's `invoke` scopes) is up to each host;

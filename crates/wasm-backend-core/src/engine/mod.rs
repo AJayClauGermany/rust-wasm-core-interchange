@@ -1,6 +1,9 @@
 //! Glue between the module registry and the WASM engines.
 
-use std::sync::Arc;
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -28,7 +31,14 @@ pub(crate) trait Host: Send + Sync {
     fn resolve_command(&self, name: &str) -> Option<String>;
     /// Names of every registered host command, sorted.
     fn command_names(&self) -> Vec<String>;
+    /// The stored value of `key` in `module`'s state.
+    fn state_get(&self, module: &str, key: &str) -> std::result::Result<Option<String>, String>;
+    /// Every stored key of `module`'s state, sorted.
+    fn state_keys(&self, module: &str) -> std::result::Result<Vec<String>, String>;
 }
+
+/// State writes of the call in progress, by key; `None` removes the key.
+pub(crate) type StateChanges = BTreeMap<String, Option<String>>;
 
 /// Host functions as seen by one module: every call is checked against the
 /// module's capabilities.
@@ -36,9 +46,83 @@ pub(crate) struct ModuleHost {
     pub module: String,
     pub capabilities: Capabilities,
     pub host: Arc<dyn Host>,
+    /// What the running call wrote to the module's state. The registry
+    /// stores it when the call returns and drops it if the call traps.
+    pub pending: Mutex<StateChanges>,
 }
 
 impl ModuleHost {
+    fn pending(&self) -> std::sync::MutexGuard<'_, StateChanges> {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The state writes made since the last call to this, emptied.
+    pub fn take_pending(&self) -> StateChanges {
+        std::mem::take(&mut self.pending())
+    }
+
+    fn check_state_key(&self, key: &str) -> std::result::Result<(), String> {
+        if self.capabilities.can_store(key) {
+            Ok(())
+        } else {
+            Err(format!(
+                "module `{}` is not allowed to use state key `{key}` (add {} or \"*\" to `capabilities.state`)",
+                self.module,
+                js_string(key),
+            ))
+        }
+    }
+
+    pub fn state_get(&self, key: &str) -> std::result::Result<Option<String>, String> {
+        self.check_state_key(key)?;
+        if let Some(written) = self.pending().get(key) {
+            return Ok(written.clone());
+        }
+        self.host.state_get(&self.module, key)
+    }
+
+    pub fn state_set(&self, key: &str, value: String) -> std::result::Result<(), String> {
+        self.check_state_key(key)?;
+        if key.len() > crate::STATE_KEY_MAX {
+            return Err(format!(
+                "state keys are at most {} bytes, this one has {}",
+                crate::STATE_KEY_MAX,
+                key.len()
+            ));
+        }
+        if value.len() > crate::STATE_VALUE_MAX {
+            return Err(format!(
+                "state values are at most {} bytes, the one for `{key}` has {}",
+                crate::STATE_VALUE_MAX,
+                value.len()
+            ));
+        }
+        self.pending().insert(key.to_string(), Some(value));
+        Ok(())
+    }
+
+    pub fn state_remove(&self, key: &str) -> std::result::Result<(), String> {
+        self.check_state_key(key)?;
+        self.pending().insert(key.to_string(), None);
+        Ok(())
+    }
+
+    /// The keys the module's capability reaches, as the running call left them.
+    pub fn state_keys(&self) -> std::result::Result<Vec<String>, String> {
+        let mut keys: std::collections::BTreeSet<String> =
+            self.host.state_keys(&self.module)?.into_iter().collect();
+        for (key, value) in self.pending().iter() {
+            match value {
+                Some(_) => keys.insert(key.clone()),
+                None => keys.remove(key),
+            };
+        }
+        Ok(keys
+            .into_iter()
+            .filter(|k| self.capabilities.can_store(k))
+            .collect())
+    }
+
     pub fn log(&self, level: log::Level, message: &str) {
         log::log!(target: "wasm_backend", level, "[{}] {}", self.module, message);
     }
@@ -122,6 +206,8 @@ pub(crate) trait ModuleInstance: Send {
     fn call(&mut self, command: &str, args: Value) -> Result<Value>;
     /// Deliver an event. A module without an event handler ignores it.
     fn on_event(&mut self, event: &str, payload: &Value) -> Result<()>;
+    /// The host side of this instance.
+    fn host(&self) -> &ModuleHost;
     /// Whether the module exports an event handler.
     fn handles_events(&self) -> bool;
     /// Commands exported by the module.
@@ -131,6 +217,13 @@ pub(crate) trait ModuleInstance: Send {
     fn imports(&self) -> Vec<CommandInfo> {
         Vec::new()
     }
+    /// Interfaces the module imports, as it names them (WIT modules only).
+    fn requires(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// How many calls into this instance have trapped so far. A call that
+    /// raises it left the module's memory reset.
+    fn traps(&self) -> u64;
     /// TypeScript declarations for the module's commands, if the engine has
     /// type information.
     fn typescript(&self, _module: &str) -> Option<String> {
@@ -167,12 +260,69 @@ pub(crate) fn js_string(s: &str) -> String {
     serde_json::Value::String(s.to_string()).to_string()
 }
 
-/// Detect the engine to use for a binary.
+/// Detect the engine to use for a binary: components, and core modules
+/// built against a WIT world (see [`has_component_type`]), use the WIT
+/// engine; other core modules are Extism plugins.
 pub(crate) fn detect(bytes: &[u8], configured: EngineKind) -> EngineKind {
     match configured {
-        EngineKind::Auto if is_component(bytes) => EngineKind::Component,
+        EngineKind::Auto if is_component(bytes) || has_component_type(bytes) => {
+            EngineKind::Component
+        }
         EngineKind::Auto => EngineKind::Extism,
         other => other,
+    }
+}
+
+/// Whether a core module carries component type information: the
+/// `component-type:*` custom section `wit-bindgen` embeds. Such a module
+/// (e.g. a Rust crate built for `wasm32-unknown-unknown`) is a component
+/// waiting to be wrapped, which the WIT engine does when it loads it.
+pub(crate) fn has_component_type(bytes: &[u8]) -> bool {
+    custom_sections(bytes).any(|name| name.starts_with("component-type"))
+}
+
+/// Names of the custom sections of a core module.
+fn custom_sections(bytes: &[u8]) -> impl Iterator<Item = &str> {
+    let mut pos = if bytes.len() >= 8 && bytes[0..8] == *b"\0asm\x01\0\0\0" {
+        8
+    } else {
+        bytes.len()
+    };
+    std::iter::from_fn(move || {
+        while pos < bytes.len() {
+            let id = bytes[pos];
+            pos += 1;
+            let size = leb(bytes, &mut pos)? as usize;
+            let start = pos;
+            pos = start.checked_add(size)?;
+            if id == 0 {
+                let mut at = start;
+                let len = leb(bytes, &mut at)? as usize;
+                let name = bytes.get(at..at.checked_add(len)?)?;
+                if let Ok(name) = std::str::from_utf8(name) {
+                    return Some(name);
+                }
+            }
+        }
+        None
+    })
+}
+
+/// Read an unsigned LEB128 number at `pos`, advancing it.
+pub(crate) fn leb(bytes: &[u8], pos: &mut usize) -> Option<u64> {
+    let mut result = 0u64;
+    let mut shift = 0;
+    loop {
+        let b = *bytes.get(*pos)?;
+        *pos += 1;
+        result |= ((b & 0x7f) as u64) << shift;
+        if b & 0x80 == 0 {
+            return Some(result);
+        }
+        shift += 7;
+        if shift > 63 {
+            return None;
+        }
     }
 }
 
@@ -218,5 +368,29 @@ mod tests {
             detect(b"\0asm\x01\x00\x00\x00", EngineKind::Component),
             EngineKind::Component
         );
+    }
+
+    #[test]
+    fn detects_core_modules_built_against_a_wit_world() {
+        // A custom section (id 0) is its size, then a name and its data.
+        let section = |name: &str| {
+            let mut s = vec![0, name.len() as u8 + 2, name.len() as u8];
+            s.extend(name.bytes());
+            s.push(0xff);
+            s
+        };
+        let mut module = b"\0asm\x01\x00\x00\x00".to_vec();
+        module.extend(section("producers"));
+        assert!(!has_component_type(&module));
+        assert_eq!(detect(&module, EngineKind::Auto), EngineKind::Extism);
+
+        module.extend(section("component-type:wit-bindgen:0.63.0:greeter"));
+        assert!(has_component_type(&module));
+        assert_eq!(detect(&module, EngineKind::Auto), EngineKind::Component);
+
+        // Truncated and foreign input is just "not one".
+        assert!(!has_component_type(&module[..module.len() - 20]));
+        assert!(!has_component_type(b"\0asm\x0d\x00\x01\x00\x00\x05"));
+        assert!(!has_component_type(b"not wasm"));
     }
 }

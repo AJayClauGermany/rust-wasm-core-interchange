@@ -17,8 +17,10 @@ use crate::capabilities::Capabilities;
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 #[serde(rename_all = "camelCase")]
 pub enum EngineKind {
-    /// Detect from the binary: WebAssembly components use the WIT engine,
-    /// core modules use Extism.
+    /// Detect from the binary: WebAssembly components, and core modules
+    /// carrying component type information (built against a WIT world for
+    /// `wasm32-unknown-unknown`), use the WIT engine; other core modules use
+    /// Extism.
     #[default]
     Auto,
     /// WebAssembly component model (WIT) via wasmtime.
@@ -47,6 +49,12 @@ pub struct Config {
     /// integrations use [`BackendBuilder::typescript_out_dir`](crate::BackendBuilder::typescript_out_dir).
     #[serde(default)]
     pub typescript_out_dir: Option<PathBuf>,
+    /// Directory module state is kept in between runs, one JSON file per
+    /// module. May start with `$APPDATA` and the like. Applied by the Tauri
+    /// plugin (default: `$APPDATA/wasm-backend/state`); other integrations
+    /// use [`BackendBuilder::state_store`](crate::BackendBuilder::state_store).
+    #[serde(default)]
+    pub state_dir: Option<PathBuf>,
 }
 
 /// Configuration of a single module.

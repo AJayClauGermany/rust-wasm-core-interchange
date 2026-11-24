@@ -5,7 +5,6 @@ use std::{
     cell::RefCell,
     collections::BTreeMap,
     fmt::Display,
-    hash::{DefaultHasher, Hash, Hasher},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock, Weak},
     time::SystemTime,
@@ -18,8 +17,9 @@ use crate::{
     Error, Result,
     capabilities::{Capabilities, Preopen, name_matches},
     config::{EngineKind, ExternalConfig, ModuleConfig},
-    engine::{self, CommandInfo, ModuleHost, ModuleInstance},
+    engine::{self, CommandInfo, ModuleHost, ModuleInstance, StateChanges},
     platform::{BaseDir, Platform, resolve_dir},
+    state::StateStore,
 };
 
 /// Emitted with a [`ModuleInfo`] payload when a module is loaded.
@@ -31,6 +31,34 @@ pub const EVENT_MODULE_RELOADED: &str = "wasm-backend://module-reloaded";
 pub const EVENT_MODULE_UNLOADED: &str = "wasm-backend://module-unloaded";
 /// Emitted with a [`ModuleError`] payload when loading or reloading fails.
 pub const EVENT_MODULE_ERROR: &str = "wasm-backend://module-error";
+/// Emitted with a [`ModuleTrap`] payload when a call into a module traps (a
+/// panic, a timeout, running out of memory).
+pub const EVENT_MODULE_TRAPPED: &str = "wasm-backend://module-trapped";
+
+/// Decides whether a module may be loaded. Set with
+/// [`BackendBuilder::load_gate`].
+pub type LoadGate<P> =
+    Arc<dyn Fn(&P, &LoadRequest<'_>) -> std::result::Result<(), String> + Send + Sync>;
+
+/// A module about to be loaded or reloaded, as shown to the
+/// [`BackendBuilder::load_gate`] before any of its code is compiled or run.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct LoadRequest<'a> {
+    /// Name the module is loaded under.
+    pub name: &'a str,
+    /// File it is loaded from (`None` for embedded bytes).
+    pub path: Option<&'a Path>,
+    /// Whether it comes from the external plugins directory.
+    pub external: bool,
+    /// SHA-256 of the module's bytes, in lowercase hex. Compare it with a
+    /// list of known plugins, or show it to the user.
+    pub sha256: &'a str,
+    /// What the module would be allowed to do.
+    pub capabilities: &'a Capabilities,
+    /// Whether this replaces a loaded module after its file changed.
+    pub reload: bool,
+}
 
 /// A host command working on JSON values. Build one from a typed closure
 /// with [`host_command_fn`].
@@ -99,6 +127,22 @@ pub struct ModuleInfo {
     pub watched: bool,
     /// Incremented on every reload.
     pub generation: u64,
+    /// SHA-256 of the module's bytes, in lowercase hex.
+    #[serde(default)]
+    pub sha256: String,
+    /// Every interface the module imports, as it names them (e.g.
+    /// `wasi:filesystem/types@0.2.6`; WIT modules only): all it can reach
+    /// outside its own memory. A module importing nothing can only compute.
+    #[serde(default)]
+    pub requires: Vec<String>,
+    /// Calls that trapped since the module was last (re)loaded. After each
+    /// one the module started again from fresh memory.
+    #[serde(default)]
+    pub traps: u32,
+    /// Whether the module trapped more often than its `maxRestarts`
+    /// capability allows. Every call fails until it is reloaded.
+    #[serde(default)]
+    pub stopped: bool,
     pub commands: Vec<CommandInfo>,
     /// Host commands the module imports as typed WIT functions, named as
     /// registered. Each one was checked when the module loaded: it exists
@@ -122,12 +166,24 @@ pub struct ModuleError {
     pub error: String,
 }
 
+/// Payload of [`EVENT_MODULE_TRAPPED`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[serde(rename_all = "camelCase")]
+pub struct ModuleTrap {
+    pub module: String,
+    pub error: String,
+    /// Traps since the module was last (re)loaded, this one included.
+    pub traps: u32,
+    /// Whether this trap stopped the module (see [`ModuleInfo::stopped`]).
+    pub stopped: bool,
+}
+
 /// Metadata, kept apart from the instance so that reading it never waits
 /// for (or deadlocks with) a running call.
 struct Meta {
     info: ModuleInfo,
     typescript: String,
-    hash: u64,
 }
 
 pub(crate) struct Module<P: Platform> {
@@ -174,6 +230,64 @@ pub(crate) struct External {
     pub(crate) config: ExternalConfig,
 }
 
+/// Module state: every module's store in memory, read from the
+/// [`StateStore`] when first needed and written back after each change.
+struct States {
+    loaded: Mutex<BTreeMap<String, BTreeMap<String, String>>>,
+    store: Option<Arc<dyn StateStore>>,
+}
+
+impl States {
+    /// Work on `module`'s state, reading it from the store first if needed.
+    fn with<T>(
+        &self,
+        module: &str,
+        f: impl FnOnce(&mut BTreeMap<String, String>) -> T,
+    ) -> std::result::Result<T, String> {
+        let mut loaded = self.loaded.lock().unwrap_or_else(|e| e.into_inner());
+        if !loaded.contains_key(module) {
+            let state = match &self.store {
+                Some(store) => store.load(module)?,
+                None => BTreeMap::new(),
+            };
+            loaded.insert(module.to_string(), state);
+        }
+        Ok(f(loaded.entry(module.to_string()).or_default()))
+    }
+
+    /// Apply the writes of a call that returned, and store the result.
+    fn commit(&self, module: &str, changes: StateChanges) -> std::result::Result<(), String> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+        let state = self.with(module, |state| {
+            for (key, value) in changes {
+                match value {
+                    Some(value) => state.insert(key, value),
+                    None => state.remove(&key),
+                };
+            }
+            state.clone()
+        })?;
+        match &self.store {
+            Some(store) => store.save(module, &state),
+            None => Ok(()),
+        }
+    }
+
+    /// Remove everything stored for `module`.
+    fn clear(&self, module: &str) -> std::result::Result<(), String> {
+        self.loaded
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(module.to_string(), BTreeMap::new());
+        match &self.store {
+            Some(store) => store.save(module, &BTreeMap::new()),
+            None => Ok(()),
+        }
+    }
+}
+
 pub(crate) struct Inner<P: Platform> {
     pub(crate) platform: P,
     modules: RwLock<BTreeMap<String, Arc<Module<P>>>>,
@@ -184,6 +298,8 @@ pub(crate) struct Inner<P: Platform> {
     pub(crate) external: Option<External>,
     typescript_dir: Option<PathBuf>,
     typescript: TypeScriptOptions,
+    load_gate: Option<LoadGate<P>>,
+    states: States,
     /// Modules that failed to load from a file; retried when it changes.
     pub(crate) pending: Mutex<BTreeMap<String, (ModuleConfig, PathBuf, bool)>>,
     #[cfg(feature = "hot-reload")]
@@ -293,6 +409,18 @@ impl<P: Platform> engine::Host for Bridge<P> {
             .map(|inner| inner.host_commands.keys().cloned().collect())
             .unwrap_or_default()
     }
+
+    fn state_get(&self, module: &str, key: &str) -> std::result::Result<Option<String>, String> {
+        let inner = self.0.upgrade().ok_or("app is shutting down")?;
+        inner.states.with(module, |state| state.get(key).cloned())
+    }
+
+    fn state_keys(&self, module: &str) -> std::result::Result<Vec<String>, String> {
+        let inner = self.0.upgrade().ok_or("app is shutting down")?;
+        inner
+            .states
+            .with(module, |state| state.keys().cloned().collect())
+    }
 }
 
 /// Find a host command by name: exactly, else across naming conventions
@@ -340,10 +468,16 @@ fn quoted_list(items: &[impl AsRef<str>]) -> String {
         .join(", ")
 }
 
-fn hash(bytes: &[u8]) -> u64 {
-    let mut h = DefaultHasher::new();
-    bytes.hash(&mut h);
-    h.finish()
+/// The SHA-256 of `bytes`, in lowercase hex.
+fn sha256(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    use std::fmt::Write;
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
 }
 
 /// Configures a [`Backend`].
@@ -355,6 +489,8 @@ pub struct BackendBuilder<P: Platform> {
     external: Option<ExternalConfig>,
     typescript_dir: Option<PathBuf>,
     typescript: TypeScriptOptions,
+    load_gate: Option<LoadGate<P>>,
+    state_store: Option<Arc<dyn StateStore>>,
 }
 
 impl<P: Platform> BackendBuilder<P> {
@@ -415,6 +551,34 @@ impl<P: Platform> BackendBuilder<P> {
         self
     }
 
+    /// Ask `gate` before any module is loaded or reloaded. It sees what is
+    /// about to run (see [`LoadRequest`]) before a byte of it is compiled;
+    /// returning `Err(reason)` refuses the load, which fails with
+    /// [`Error::NotAllowed`] (and a refused reload keeps the previous
+    /// version running).
+    ///
+    /// Use it to decide which third-party plugins run: check
+    /// [`LoadRequest::sha256`] against a list the user approved, say. The
+    /// same file may be asked about again (it is retried when the plugins
+    /// directory changes), so remember the answer rather than asking the
+    /// user twice.
+    pub fn load_gate<F>(mut self, gate: F) -> Self
+    where
+        F: Fn(&P, &LoadRequest<'_>) -> std::result::Result<(), String> + Send + Sync + 'static,
+    {
+        self.load_gate = Some(Arc::new(gate));
+        self
+    }
+
+    /// Keep module state (what modules store through `tauri:backend/state`)
+    /// in `store`, so it outlives the app: [`FileStateStore`](crate::FileStateStore)
+    /// for one JSON file per module, or your own [`StateStore`]. Without
+    /// one, state survives reloads and traps but not the backend.
+    pub fn state_store(mut self, store: impl StateStore) -> Self {
+        self.state_store = Some(Arc::new(store));
+        self
+    }
+
     /// Create the backend. No module is loaded yet: call
     /// [`Backend::load_all`] (or [`Backend::load`]) next. Splitting the two
     /// lets an integration publish the backend (e.g. as app state) before
@@ -446,6 +610,11 @@ impl<P: Platform> BackendBuilder<P> {
             external,
             typescript_dir: self.typescript_dir,
             typescript: self.typescript,
+            load_gate: self.load_gate,
+            states: States {
+                loaded: Mutex::new(BTreeMap::new()),
+                store: self.state_store,
+            },
             pending: Mutex::new(BTreeMap::new()),
             #[cfg(feature = "hot-reload")]
             watcher: Mutex::new(None),
@@ -463,6 +632,8 @@ impl<P: Platform> Backend<P> {
             external: None,
             typescript_dir: None,
             typescript: TypeScriptOptions::default(),
+            load_gate: None,
+            state_store: None,
         }
     }
 
@@ -494,8 +665,68 @@ impl<P: Platform> Backend<P> {
     /// [`Backend::invoke_async`].
     pub fn invoke(&self, module: &str, command: &str, args: Value) -> Result<Value> {
         let m = self.get(module)?;
-        let _guard = CallGuard::enter(module)?;
-        m.instance().call(command, args)
+        self.run(&m, |instance| instance.call(command, args))
+    }
+
+    /// Run one call into a module, unless it was stopped, and count the
+    /// trap if it ends in one.
+    fn run<T>(
+        &self,
+        m: &Module<P>,
+        call: impl FnOnce(&mut dyn ModuleInstance) -> Result<T>,
+    ) -> Result<T> {
+        let _guard = CallGuard::enter(&m.name)?;
+        let mut instance = m.instance();
+        {
+            let meta = m.meta();
+            if meta.info.stopped {
+                return Err(Error::Stopped {
+                    module: m.name.clone(),
+                    traps: meta.info.traps,
+                });
+            }
+        }
+        let before = instance.traps();
+        let result = call(instance.as_mut());
+        let trapped = instance.traps() != before;
+        // What the call wrote to the module's state is kept only if it
+        // returned: a trap leaves the state as it was before the call.
+        let written = instance.host().take_pending();
+        if !trapped {
+            self.commit_state(&m.name, written);
+        }
+        // Counted before the next call can start, so the one after the last
+        // allowed restart never runs.
+        let trap = match &result {
+            Err(error) if trapped => {
+                let mut meta = m.meta.write().unwrap_or_else(|e| e.into_inner());
+                meta.info.traps = meta.info.traps.saturating_add(1);
+                meta.info.stopped = m
+                    .config
+                    .capabilities
+                    .max_restarts
+                    .is_some_and(|max| meta.info.traps > max);
+                Some(ModuleTrap {
+                    module: m.name.clone(),
+                    error: error.to_string(),
+                    traps: meta.info.traps,
+                    stopped: meta.info.stopped,
+                })
+            }
+            _ => None,
+        };
+        drop(instance);
+        if let Some(trap) = trap {
+            if trap.stopped {
+                log::error!(
+                    "WASM module `{}` was stopped after trapping {} times; reload it to start it again",
+                    trap.module,
+                    trap.traps
+                );
+            }
+            self.emit_lifecycle(EVENT_MODULE_TRAPPED, &trap);
+        }
+        result
     }
 
     /// [`Backend::invoke`] on a blocking thread, via
@@ -536,8 +767,32 @@ impl<P: Platform> Backend<P> {
     /// its `events.listen` subscriptions.
     pub fn send_event(&self, module: &str, event: &str, payload: &Value) -> Result<()> {
         let m = self.get(module)?;
-        let _guard = CallGuard::enter(module)?;
-        m.instance().on_event(event, payload)
+        self.run(&m, |instance| instance.on_event(event, payload))
+    }
+
+    /// Store state writes, reporting a store that fails: the call that made
+    /// them has returned, so there is nobody to hand the error to.
+    fn commit_state(&self, module: &str, written: StateChanges) {
+        if let Err(e) = self.0.states.commit(module, written) {
+            self.report_error(module, &Error::State(e));
+        }
+    }
+
+    /// A module's state store: what it wrote through `tauri:backend/state`
+    /// (`tauri_state_*` for Extism), whether or not it is loaded right now.
+    /// Writes of a call still running are not in it yet.
+    pub fn state(&self, module: &str) -> Result<BTreeMap<String, String>> {
+        self.0
+            .states
+            .with(module, |state| state.clone())
+            .map_err(Error::State)
+    }
+
+    /// Remove everything a module stored, e.g. when the user uninstalls a
+    /// plugin. Unloading a module keeps its state; a module loaded under
+    /// the same name later finds it again.
+    pub fn clear_state(&self, module: &str) -> Result<()> {
+        self.0.states.clear(module).map_err(Error::State)
     }
 
     /// Information about every loaded module.
@@ -609,7 +864,8 @@ impl<P: Platform> Backend<P> {
     }
 
     /// Reload a module from its file, even if the file is unchanged (which
-    /// resets the module's state). Blocks while the module compiles.
+    /// resets the module's state, and starts a stopped module again). Blocks
+    /// while the module compiles.
     pub fn reload(&self, name: &str) -> Result<ModuleInfo> {
         let m = self.get(name)?;
         let result = self
@@ -633,14 +889,25 @@ impl<P: Platform> Backend<P> {
             )));
         };
         let bytes = std::fs::read(path)?;
-        let new_hash = hash(&bytes);
-        if only_if_changed && m.meta().hash == new_hash {
+        let new_hash = sha256(&bytes);
+        if only_if_changed && m.meta().info.sha256 == new_hash {
             return Ok(None);
         }
         // Compile and instantiate outside the lock so calls keep being served
         // by the old instance meanwhile.
         let started = SystemTime::now();
-        let (instance, kind) = self.instantiate(&m.name, &m.config, &bytes)?;
+        let (instance, kind) = self.instantiate(
+            &LoadRequest {
+                name: &m.name,
+                path: Some(path),
+                external: m.external,
+                sha256: &new_hash,
+                capabilities: &m.config.capabilities,
+                reload: true,
+            },
+            &m.config,
+            &bytes,
+        )?;
         let _guard = CallGuard::enter(&m.name)?;
         // The module may have been unloaded or replaced while compiling.
         let current = self.get(&m.name)?;
@@ -649,18 +916,24 @@ impl<P: Platform> Backend<P> {
         }
         let commands = instance.commands();
         let imports = instance.imports();
+        let requires = instance.requires();
         let warnings = self.lint(&m.name, &m.config.capabilities, instance.as_ref());
         let typescript = instance.typescript(&m.name).unwrap_or_default();
+        // Anything it stored while starting up.
+        self.commit_state(&m.name, instance.host().take_pending());
         *m.instance() = instance;
         let info = {
             let mut meta = m.meta.write().unwrap_or_else(|e| e.into_inner());
             meta.info.commands = commands;
             meta.info.imports = imports;
+            meta.info.requires = requires;
+            meta.info.traps = 0;
+            meta.info.stopped = false;
             meta.info.warnings = warnings;
             meta.info.engine = kind;
             meta.info.generation += 1;
             meta.typescript = typescript;
-            meta.hash = new_hash;
+            meta.info.sha256 = new_hash;
             meta.info.clone()
         };
         log::info!(
@@ -723,6 +996,17 @@ impl<P: Platform> Backend<P> {
                 quoted_list(&caps.events.listen)
             ));
         }
+        if caps.state.is_empty()
+            && instance
+                .requires()
+                .iter()
+                .any(|i| i.starts_with("tauri:backend/state"))
+        {
+            warnings.push(
+                "the module imports `tauri:backend/state` but `capabilities.state` grants no keys, so every state call is refused (add e.g. `\"state\": [\"*\"]`)"
+                    .to_string(),
+            );
+        }
         let registered: Vec<&String> = self.0.host_commands.keys().collect();
         for pattern in &caps.host_commands {
             if !registered.iter().any(|c| name_matches(pattern, c)) {
@@ -742,17 +1026,28 @@ impl<P: Platform> Backend<P> {
         warnings
     }
 
+    /// Ask the load gate, then compile and instantiate the module.
     fn instantiate(
         &self,
-        name: &str,
+        request: &LoadRequest<'_>,
         config: &ModuleConfig,
         bytes: &[u8],
     ) -> Result<(Box<dyn ModuleInstance>, EngineKind)> {
+        let name = request.name;
+        if let Some(gate) = &self.0.load_gate {
+            gate(&self.0.platform, request).map_err(|reason| {
+                Error::NotAllowed(format!(
+                    "loading WASM module `{name}` (sha256 {}) was refused: {reason}",
+                    request.sha256
+                ))
+            })?;
+        }
         let kind = engine::detect(bytes, config.engine);
         let host = Arc::new(ModuleHost {
             module: name.to_string(),
             capabilities: self.resolve_capabilities(&config.capabilities)?,
             host: Arc::new(Bridge(Arc::downgrade(&self.0))),
+            pending: Mutex::default(),
         });
         Ok((engine::instantiate(kind, bytes, host)?, kind))
     }
@@ -854,8 +1149,22 @@ impl<P: Platform> Backend<P> {
             };
 
         let started = SystemTime::now();
-        let (instance, kind) = self.instantiate(name, &config, &bytes)?;
+        let hash = sha256(&bytes);
+        let (instance, kind) = self.instantiate(
+            &LoadRequest {
+                name,
+                path: path.as_deref(),
+                external,
+                sha256: &hash,
+                capabilities: &config.capabilities,
+                reload: false,
+            },
+            &config,
+            &bytes,
+        )?;
         let watched = path.is_some() && config.watch.unwrap_or(self.0.hot_reload);
+        // Anything it stored while starting up.
+        self.commit_state(name, instance.host().take_pending());
         let warnings = self.lint(name, &config.capabilities, instance.as_ref());
         let info = ModuleInfo {
             name: name.to_string(),
@@ -865,6 +1174,10 @@ impl<P: Platform> Backend<P> {
             exposed: config.expose.unwrap_or(!external),
             watched,
             generation: 0,
+            sha256: hash,
+            requires: instance.requires(),
+            traps: 0,
+            stopped: false,
             commands: instance.commands(),
             imports: instance.imports(),
             capabilities: config.capabilities.clone(),
@@ -877,7 +1190,6 @@ impl<P: Platform> Backend<P> {
             meta: RwLock::new(Meta {
                 info: info.clone(),
                 typescript: instance.typescript(name).unwrap_or_default(),
-                hash: hash(&bytes),
             }),
             instance: Mutex::new(instance),
             listeners: Mutex::new(Vec::new()),

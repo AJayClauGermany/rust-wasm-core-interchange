@@ -12,7 +12,7 @@ exclude = ["/tests"]
 [features]
 default = ["component", "extism", "hot-reload"]
 # WIT / WebAssembly component model engine (wasmtime).
-component = ["dep:wasmtime", "dep:wasmtime-wasi"]
+component = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:wit-component"]
 # Extism plugin engine.
 extism = ["dep:extism", "dep:wasmtime"]
 # Watch module files and reload them on change.
@@ -26,9 +26,13 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 log = "0.4"
+sha2 = "0.10"
 # Keep in lock-step with the wasmtime version used by `extism` so it is only compiled once.
 wasmtime = { version = "49", optional = true, features = ["incremental-cache"] }
 wasmtime-wasi = { version = "49", optional = true }
+# Wraps core modules built against a WIT world into components. The version
+# wasmtime 49 builds with, so it is only compiled once.
+wit-component = { version = "0.258", optional = true }
 extism = { version = "1.41", optional = true }
 notify = { version = "8", optional = true }
 specta = { version = "=2.0.0-rc.28", optional = true, features = ["derive"] }
