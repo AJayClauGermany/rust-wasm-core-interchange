@@ -1,6 +1,9 @@
 //! Glue between the module registry and the WASM engines.
 
-use std::sync::Arc;
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -28,7 +31,14 @@ pub(crate) trait Host: Send + Sync {
     fn resolve_command(&self, name: &str) -> Option<String>;
     /// Names of every registered host command, sorted.
     fn command_names(&self) -> Vec<String>;
+    /// The stored value of `key` in `module`'s state.
+    fn state_get(&self, module: &str, key: &str) -> std::result::Result<Option<String>, String>;
+    /// Every stored key of `module`'s state, sorted.
+    fn state_keys(&self, module: &str) -> std::result::Result<Vec<String>, String>;
 }
+
+/// State writes of the call in progress, by key; `None` removes the key.
+pub(crate) type StateChanges = BTreeMap<String, Option<String>>;
 
 /// Host functions as seen by one module: every call is checked against the
 /// module's capabilities.
@@ -36,9 +46,83 @@ pub(crate) struct ModuleHost {
     pub module: String,
     pub capabilities: Capabilities,
     pub host: Arc<dyn Host>,
+    /// What the running call wrote to the module's state. The registry
+    /// stores it when the call returns and drops it if the call traps.
+    pub pending: Mutex<StateChanges>,
 }
 
 impl ModuleHost {
+    fn pending(&self) -> std::sync::MutexGuard<'_, StateChanges> {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The state writes made since the last call to this, emptied.
+    pub fn take_pending(&self) -> StateChanges {
+        std::mem::take(&mut self.pending())
+    }
+
+    fn check_state_key(&self, key: &str) -> std::result::Result<(), String> {
+        if self.capabilities.can_store(key) {
+            Ok(())
+        } else {
+            Err(format!(
+                "module `{}` is not allowed to use state key `{key}` (add {} or \"*\" to `capabilities.state`)",
+                self.module,
+                js_string(key),
+            ))
+        }
+    }
+
+    pub fn state_get(&self, key: &str) -> std::result::Result<Option<String>, String> {
+        self.check_state_key(key)?;
+        if let Some(written) = self.pending().get(key) {
+            return Ok(written.clone());
+        }
+        self.host.state_get(&self.module, key)
+    }
+
+    pub fn state_set(&self, key: &str, value: String) -> std::result::Result<(), String> {
+        self.check_state_key(key)?;
+        if key.len() > crate::STATE_KEY_MAX {
+            return Err(format!(
+                "state keys are at most {} bytes, this one has {}",
+                crate::STATE_KEY_MAX,
+                key.len()
+            ));
+        }
+        if value.len() > crate::STATE_VALUE_MAX {
+            return Err(format!(
+                "state values are at most {} bytes, the one for `{key}` has {}",
+                crate::STATE_VALUE_MAX,
+                value.len()
+            ));
+        }
+        self.pending().insert(key.to_string(), Some(value));
+        Ok(())
+    }
+
+    pub fn state_remove(&self, key: &str) -> std::result::Result<(), String> {
+        self.check_state_key(key)?;
+        self.pending().insert(key.to_string(), None);
+        Ok(())
+    }
+
+    /// The keys the module's capability reaches, as the running call left them.
+    pub fn state_keys(&self) -> std::result::Result<Vec<String>, String> {
+        let mut keys: std::collections::BTreeSet<String> =
+            self.host.state_keys(&self.module)?.into_iter().collect();
+        for (key, value) in self.pending().iter() {
+            match value {
+                Some(_) => keys.insert(key.clone()),
+                None => keys.remove(key),
+            };
+        }
+        Ok(keys
+            .into_iter()
+            .filter(|k| self.capabilities.can_store(k))
+            .collect())
+    }
+
     pub fn log(&self, level: log::Level, message: &str) {
         log::log!(target: "wasm_backend", level, "[{}] {}", self.module, message);
     }
@@ -122,6 +206,8 @@ pub(crate) trait ModuleInstance: Send {
     fn call(&mut self, command: &str, args: Value) -> Result<Value>;
     /// Deliver an event. A module without an event handler ignores it.
     fn on_event(&mut self, event: &str, payload: &Value) -> Result<()>;
+    /// The host side of this instance.
+    fn host(&self) -> &ModuleHost;
     /// Whether the module exports an event handler.
     fn handles_events(&self) -> bool;
     /// Commands exported by the module.

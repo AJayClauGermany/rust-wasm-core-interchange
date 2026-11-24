@@ -236,6 +236,7 @@ fn configuration_warnings() {
                 Capabilities::default()
                     .allow_host_command("echo")
                     .allow_host_command("app_verison")
+                    .allow_state("*")
                     .listen("app://ping"),
             ),
         )

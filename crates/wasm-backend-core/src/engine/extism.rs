@@ -14,6 +14,12 @@
 //! | `tauri_log`    | `{ "level", "message" }`       | -                                    |
 //! | `tauri_emit`   | `{ "event", "payload" }`       | `{ "ok": null }` or `{ "err": msg }` |
 //! | `tauri_invoke` | `{ "command", "args" }`        | `{ "ok": value }` or `{ "err": msg }`|
+//! | `tauri_state_get`    | `{ "key" }`              | `{ "ok": value or null }` or `{ "err": msg }` |
+//! | `tauri_state_set`    | `{ "key", "value" }`     | `{ "ok": null }` or `{ "err": msg }` |
+//! | `tauri_state_remove` | `{ "key" }`              | `{ "ok": null }` or `{ "err": msg }` |
+//! | `tauri_state_keys`   | anything                 | `{ "ok": [key, ...] }` or `{ "err": msg }` |
+//!
+//! State values are strings (see the `tauri:backend/state` WIT interface).
 //!
 //! Events subscribed to via `capabilities.events.listen` are delivered to an
 //! exported `on_event` (or `onEvent`) function with `{ "event", "payload" }`
@@ -128,6 +134,10 @@ impl ModuleInstance for ExtismInstance {
         self.traps
     }
 
+    fn host(&self) -> &ModuleHost {
+        &self.host
+    }
+
     fn call(&mut self, command: &str, args: Value) -> Result<Value> {
         let function = self
             .resolve(command)
@@ -198,6 +208,34 @@ fn host_functions(host: &Arc<ModuleHost>) -> Vec<Function> {
     vec![
         Function::new("tauri_log", [PTR], [], data.clone(), tauri_log),
         Function::new("tauri_emit", [PTR], [PTR], data.clone(), tauri_emit),
+        Function::new(
+            "tauri_state_get",
+            [PTR],
+            [PTR],
+            data.clone(),
+            tauri_state_get,
+        ),
+        Function::new(
+            "tauri_state_set",
+            [PTR],
+            [PTR],
+            data.clone(),
+            tauri_state_set,
+        ),
+        Function::new(
+            "tauri_state_remove",
+            [PTR],
+            [PTR],
+            data.clone(),
+            tauri_state_remove,
+        ),
+        Function::new(
+            "tauri_state_keys",
+            [PTR],
+            [PTR],
+            data.clone(),
+            tauri_state_keys,
+        ),
         Function::new("tauri_invoke", [PTR], [PTR], data, tauri_invoke),
     ]
 }
@@ -291,6 +329,56 @@ fn tauri_invoke(
     let result = with_host(&data, |h| h.invoke(&args.command, &args.args.to_string()))?
         .and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string()));
     output(plugin, outputs, result)
+}
+
+#[derive(Deserialize)]
+struct StateArgs {
+    key: String,
+    #[serde(default)]
+    value: String,
+}
+
+fn tauri_state_get(
+    plugin: &mut CurrentPlugin,
+    inputs: &[Val],
+    outputs: &mut [Val],
+    data: Shared,
+) -> std::result::Result<(), extism::Error> {
+    let args: StateArgs = input(plugin, inputs)?;
+    let result = with_host(&data, |h| h.state_get(&args.key))?;
+    output(plugin, outputs, result.map(Value::from))
+}
+
+fn tauri_state_set(
+    plugin: &mut CurrentPlugin,
+    inputs: &[Val],
+    outputs: &mut [Val],
+    data: Shared,
+) -> std::result::Result<(), extism::Error> {
+    let args: StateArgs = input(plugin, inputs)?;
+    let result = with_host(&data, |h| h.state_set(&args.key, args.value))?;
+    output(plugin, outputs, result.map(|_| Value::Null))
+}
+
+fn tauri_state_remove(
+    plugin: &mut CurrentPlugin,
+    inputs: &[Val],
+    outputs: &mut [Val],
+    data: Shared,
+) -> std::result::Result<(), extism::Error> {
+    let args: StateArgs = input(plugin, inputs)?;
+    let result = with_host(&data, |h| h.state_remove(&args.key))?;
+    output(plugin, outputs, result.map(|_| Value::Null))
+}
+
+fn tauri_state_keys(
+    plugin: &mut CurrentPlugin,
+    _inputs: &[Val],
+    outputs: &mut [Val],
+    data: Shared,
+) -> std::result::Result<(), extism::Error> {
+    let result = with_host(&data, |h| h.state_keys())?;
+    output(plugin, outputs, result.map(Value::from))
 }
 
 /// Names of the functions exported by a core WebAssembly module.

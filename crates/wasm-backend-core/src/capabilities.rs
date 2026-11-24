@@ -20,6 +20,11 @@ pub struct Capabilities {
     /// Events the module may emit and receive.
     #[serde(default)]
     pub events: EventCapabilities,
+    /// Keys of its own state store the module may read and write through
+    /// `tauri:backend/state` (`tauri_state_*` for Extism). Supports `*`
+    /// wildcards; `["*"]` grants the whole store.
+    #[serde(default)]
+    pub state: Vec<String>,
     /// WASI access (filesystem, environment, stdio, sockets).
     #[serde(default)]
     pub wasi: WasiCapabilities,
@@ -109,6 +114,13 @@ impl Capabilities {
         self
     }
 
+    /// Let the module read and write the keys of its state store matching
+    /// `pattern` (`*` for all of it).
+    pub fn allow_state(mut self, pattern: impl Into<String>) -> Self {
+        self.state.push(pattern.into());
+        self
+    }
+
     pub fn stdio(mut self, enabled: bool) -> Self {
         self.wasi.stdio = enabled;
         self
@@ -135,6 +147,10 @@ impl Capabilities {
     /// commands do (`app_version` allows `app-version` and `appVersion`).
     pub(crate) fn can_invoke(&self, command: &str) -> bool {
         self.host_commands.iter().any(|p| name_matches(p, command))
+    }
+
+    pub(crate) fn can_store(&self, key: &str) -> bool {
+        any_match(&self.state, key)
     }
 
     pub(crate) fn can_emit(&self, event: &str) -> bool {

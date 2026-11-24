@@ -39,11 +39,12 @@ use crate::{Error, Result};
 mod bindings {
     wasmtime::component::bindgen!({
         path: "wit/backend.wit",
-        world: "module",
+        world: "host-imports",
     });
 }
 
 use bindings::tauri::backend::host::{self as host_iface, LogLevel};
+use bindings::tauri::backend::state as state_iface;
 
 const EVENTS_INTERFACE: &str = "tauri:backend/events";
 /// Granularity of call timeouts.
@@ -83,6 +84,24 @@ impl host_iface::Host for State {
 
     fn invoke(&mut self, command: String, args: String) -> std::result::Result<String, String> {
         self.host.invoke(&command, &args)
+    }
+}
+
+impl state_iface::Host for State {
+    fn get(&mut self, key: String) -> std::result::Result<Option<String>, String> {
+        self.host.state_get(&key)
+    }
+
+    fn set(&mut self, key: String, value: String) -> std::result::Result<(), String> {
+        self.host.state_set(&key, value)
+    }
+
+    fn remove(&mut self, key: String) -> std::result::Result<(), String> {
+        self.host.state_remove(&key)
+    }
+
+    fn keys(&mut self) -> std::result::Result<Vec<String>, String> {
+        self.host.state_keys()
     }
 }
 
@@ -142,6 +161,8 @@ fn runtime() -> Result<&'static Runtime> {
             let mut linker = Linker::new(&engine);
             wasmtime_wasi::p2::add_to_linker_sync(&mut linker).map_err(|e| e.to_string())?;
             host_iface::add_to_linker::<State, HasSelf<State>>(&mut linker, |s| s)
+                .map_err(|e| e.to_string())?;
+            state_iface::add_to_linker::<State, HasSelf<State>>(&mut linker, |s| s)
                 .map_err(|e| e.to_string())?;
             Ok(Runtime {
                 engine,
@@ -555,6 +576,10 @@ impl ModuleInstance for ComponentInstance {
 
     fn traps(&self) -> u64 {
         self.traps
+    }
+
+    fn host(&self) -> &ModuleHost {
+        &self.host
     }
 
     fn typescript(&self, module: &str) -> Option<String> {

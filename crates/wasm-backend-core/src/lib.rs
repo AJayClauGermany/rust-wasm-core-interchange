@@ -18,6 +18,9 @@
 //!   the component model yet. Exported functions are commands taking and
 //!   returning JSON.
 //!
+//! A module's memory is reset when it is reloaded or traps; what it keeps
+//! through the `tauri:backend/state` interface is not (see [`StateStore`]).
+//!
 //! The guest-facing API (the `tauri:backend` WIT package and the
 //! `tauri_*` Extism host functions) is the same on every platform, so a
 //! module built for the Tauri plugin runs unchanged elsewhere.
@@ -89,6 +92,7 @@ mod error;
 pub mod naming;
 mod platform;
 mod registry;
+mod state;
 mod task;
 #[cfg(feature = "hot-reload")]
 mod watcher;
@@ -105,6 +109,8 @@ pub use registry::{
     EVENT_MODULE_TRAPPED, EVENT_MODULE_UNLOADED, HostCall, HostCommandFn, LoadGate, LoadRequest,
     ModuleError, ModuleInfo, ModuleTrap, TypeScriptOptions, host_command_fn,
 };
+
+pub use state::{FileStateStore, STATE_KEY_MAX, STATE_VALUE_MAX, StateStore};
 
 /// The WIT package modules import (`tauri:backend`), for tools that need to
 /// hand it to guest builds.

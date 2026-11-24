@@ -75,6 +75,14 @@ third-party plugins:
   trap after the n-th restart stops the module: calls fail with
   `Error::Stopped` until it is reloaded. `ModuleInfo::traps` and `stopped`
   say where it stands.
+- **A state store per module.** A module's memory is reset when it is
+  reloaded or traps. What it stores through the `tauri:backend/state`
+  interface (`tauri_state_*` for Extism) is kept by the host instead, behind
+  the `state` capability (key patterns, e.g. `Capabilities::allow_state("*")`).
+  Writes made during a call are kept when it returns and dropped if it traps.
+  `BackendBuilder::state_store(FileStateStore::new(dir))` keeps state between
+  runs of the app (or implement `StateStore`); `Backend::state` and
+  `clear_state` read and wipe a module's store.
 - **WIT guests without WASI.** A core module built against a WIT world (a
   Rust crate using `wit-bindgen`, built for `wasm32-unknown-unknown`) is
   detected by its `component-type` section and wrapped into a component when

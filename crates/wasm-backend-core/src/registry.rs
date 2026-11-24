@@ -17,8 +17,9 @@ use crate::{
     Error, Result,
     capabilities::{Capabilities, Preopen, name_matches},
     config::{EngineKind, ExternalConfig, ModuleConfig},
-    engine::{self, CommandInfo, ModuleHost, ModuleInstance},
+    engine::{self, CommandInfo, ModuleHost, ModuleInstance, StateChanges},
     platform::{BaseDir, Platform, resolve_dir},
+    state::StateStore,
 };
 
 /// Emitted with a [`ModuleInfo`] payload when a module is loaded.
@@ -229,6 +230,64 @@ pub(crate) struct External {
     pub(crate) config: ExternalConfig,
 }
 
+/// Module state: every module's store in memory, read from the
+/// [`StateStore`] when first needed and written back after each change.
+struct States {
+    loaded: Mutex<BTreeMap<String, BTreeMap<String, String>>>,
+    store: Option<Arc<dyn StateStore>>,
+}
+
+impl States {
+    /// Work on `module`'s state, reading it from the store first if needed.
+    fn with<T>(
+        &self,
+        module: &str,
+        f: impl FnOnce(&mut BTreeMap<String, String>) -> T,
+    ) -> std::result::Result<T, String> {
+        let mut loaded = self.loaded.lock().unwrap_or_else(|e| e.into_inner());
+        if !loaded.contains_key(module) {
+            let state = match &self.store {
+                Some(store) => store.load(module)?,
+                None => BTreeMap::new(),
+            };
+            loaded.insert(module.to_string(), state);
+        }
+        Ok(f(loaded.entry(module.to_string()).or_default()))
+    }
+
+    /// Apply the writes of a call that returned, and store the result.
+    fn commit(&self, module: &str, changes: StateChanges) -> std::result::Result<(), String> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+        let state = self.with(module, |state| {
+            for (key, value) in changes {
+                match value {
+                    Some(value) => state.insert(key, value),
+                    None => state.remove(&key),
+                };
+            }
+            state.clone()
+        })?;
+        match &self.store {
+            Some(store) => store.save(module, &state),
+            None => Ok(()),
+        }
+    }
+
+    /// Remove everything stored for `module`.
+    fn clear(&self, module: &str) -> std::result::Result<(), String> {
+        self.loaded
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(module.to_string(), BTreeMap::new());
+        match &self.store {
+            Some(store) => store.save(module, &BTreeMap::new()),
+            None => Ok(()),
+        }
+    }
+}
+
 pub(crate) struct Inner<P: Platform> {
     pub(crate) platform: P,
     modules: RwLock<BTreeMap<String, Arc<Module<P>>>>,
@@ -240,6 +299,7 @@ pub(crate) struct Inner<P: Platform> {
     typescript_dir: Option<PathBuf>,
     typescript: TypeScriptOptions,
     load_gate: Option<LoadGate<P>>,
+    states: States,
     /// Modules that failed to load from a file; retried when it changes.
     pub(crate) pending: Mutex<BTreeMap<String, (ModuleConfig, PathBuf, bool)>>,
     #[cfg(feature = "hot-reload")]
@@ -349,6 +409,18 @@ impl<P: Platform> engine::Host for Bridge<P> {
             .map(|inner| inner.host_commands.keys().cloned().collect())
             .unwrap_or_default()
     }
+
+    fn state_get(&self, module: &str, key: &str) -> std::result::Result<Option<String>, String> {
+        let inner = self.0.upgrade().ok_or("app is shutting down")?;
+        inner.states.with(module, |state| state.get(key).cloned())
+    }
+
+    fn state_keys(&self, module: &str) -> std::result::Result<Vec<String>, String> {
+        let inner = self.0.upgrade().ok_or("app is shutting down")?;
+        inner
+            .states
+            .with(module, |state| state.keys().cloned().collect())
+    }
 }
 
 /// Find a host command by name: exactly, else across naming conventions
@@ -418,6 +490,7 @@ pub struct BackendBuilder<P: Platform> {
     typescript_dir: Option<PathBuf>,
     typescript: TypeScriptOptions,
     load_gate: Option<LoadGate<P>>,
+    state_store: Option<Arc<dyn StateStore>>,
 }
 
 impl<P: Platform> BackendBuilder<P> {
@@ -497,6 +570,15 @@ impl<P: Platform> BackendBuilder<P> {
         self
     }
 
+    /// Keep module state (what modules store through `tauri:backend/state`)
+    /// in `store`, so it outlives the app: [`FileStateStore`](crate::FileStateStore)
+    /// for one JSON file per module, or your own [`StateStore`]. Without
+    /// one, state survives reloads and traps but not the backend.
+    pub fn state_store(mut self, store: impl StateStore) -> Self {
+        self.state_store = Some(Arc::new(store));
+        self
+    }
+
     /// Create the backend. No module is loaded yet: call
     /// [`Backend::load_all`] (or [`Backend::load`]) next. Splitting the two
     /// lets an integration publish the backend (e.g. as app state) before
@@ -529,6 +611,10 @@ impl<P: Platform> BackendBuilder<P> {
             typescript_dir: self.typescript_dir,
             typescript: self.typescript,
             load_gate: self.load_gate,
+            states: States {
+                loaded: Mutex::new(BTreeMap::new()),
+                store: self.state_store,
+            },
             pending: Mutex::new(BTreeMap::new()),
             #[cfg(feature = "hot-reload")]
             watcher: Mutex::new(None),
@@ -547,6 +633,7 @@ impl<P: Platform> Backend<P> {
             typescript_dir: None,
             typescript: TypeScriptOptions::default(),
             load_gate: None,
+            state_store: None,
         }
     }
 
@@ -602,6 +689,12 @@ impl<P: Platform> Backend<P> {
         let before = instance.traps();
         let result = call(instance.as_mut());
         let trapped = instance.traps() != before;
+        // What the call wrote to the module's state is kept only if it
+        // returned: a trap leaves the state as it was before the call.
+        let written = instance.host().take_pending();
+        if !trapped {
+            self.commit_state(&m.name, written);
+        }
         // Counted before the next call can start, so the one after the last
         // allowed restart never runs.
         let trap = match &result {
@@ -675,6 +768,31 @@ impl<P: Platform> Backend<P> {
     pub fn send_event(&self, module: &str, event: &str, payload: &Value) -> Result<()> {
         let m = self.get(module)?;
         self.run(&m, |instance| instance.on_event(event, payload))
+    }
+
+    /// Store state writes, reporting a store that fails: the call that made
+    /// them has returned, so there is nobody to hand the error to.
+    fn commit_state(&self, module: &str, written: StateChanges) {
+        if let Err(e) = self.0.states.commit(module, written) {
+            self.report_error(module, &Error::State(e));
+        }
+    }
+
+    /// A module's state store: what it wrote through `tauri:backend/state`
+    /// (`tauri_state_*` for Extism), whether or not it is loaded right now.
+    /// Writes of a call still running are not in it yet.
+    pub fn state(&self, module: &str) -> Result<BTreeMap<String, String>> {
+        self.0
+            .states
+            .with(module, |state| state.clone())
+            .map_err(Error::State)
+    }
+
+    /// Remove everything a module stored, e.g. when the user uninstalls a
+    /// plugin. Unloading a module keeps its state; a module loaded under
+    /// the same name later finds it again.
+    pub fn clear_state(&self, module: &str) -> Result<()> {
+        self.0.states.clear(module).map_err(Error::State)
     }
 
     /// Information about every loaded module.
@@ -801,6 +919,8 @@ impl<P: Platform> Backend<P> {
         let requires = instance.requires();
         let warnings = self.lint(&m.name, &m.config.capabilities, instance.as_ref());
         let typescript = instance.typescript(&m.name).unwrap_or_default();
+        // Anything it stored while starting up.
+        self.commit_state(&m.name, instance.host().take_pending());
         *m.instance() = instance;
         let info = {
             let mut meta = m.meta.write().unwrap_or_else(|e| e.into_inner());
@@ -876,6 +996,17 @@ impl<P: Platform> Backend<P> {
                 quoted_list(&caps.events.listen)
             ));
         }
+        if caps.state.is_empty()
+            && instance
+                .requires()
+                .iter()
+                .any(|i| i.starts_with("tauri:backend/state"))
+        {
+            warnings.push(
+                "the module imports `tauri:backend/state` but `capabilities.state` grants no keys, so every state call is refused (add e.g. `\"state\": [\"*\"]`)"
+                    .to_string(),
+            );
+        }
         let registered: Vec<&String> = self.0.host_commands.keys().collect();
         for pattern in &caps.host_commands {
             if !registered.iter().any(|c| name_matches(pattern, c)) {
@@ -916,6 +1047,7 @@ impl<P: Platform> Backend<P> {
             module: name.to_string(),
             capabilities: self.resolve_capabilities(&config.capabilities)?,
             host: Arc::new(Bridge(Arc::downgrade(&self.0))),
+            pending: Mutex::default(),
         });
         Ok((engine::instantiate(kind, bytes, host)?, kind))
     }
@@ -1031,6 +1163,8 @@ impl<P: Platform> Backend<P> {
             &bytes,
         )?;
         let watched = path.is_some() && config.watch.unwrap_or(self.0.hot_reload);
+        // Anything it stored while starting up.
+        self.commit_state(name, instance.host().take_pending());
         let warnings = self.lint(name, &config.capabilities, instance.as_ref());
         let info = ModuleInfo {
             name: name.to_string(),

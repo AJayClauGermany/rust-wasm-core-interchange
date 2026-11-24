@@ -31,6 +31,10 @@ pub enum Error {
     /// allows and stays stopped until it is reloaded.
     #[error("WASM module `{module}` was stopped after trapping {traps} times and must be reloaded")]
     Stopped { module: String, traps: u32 },
+    /// A module's state could not be read from or written to the
+    /// [`StateStore`](crate::StateStore).
+    #[error("WASM module state: {0}")]
+    State(String),
     #[error("{0}")]
     NotAllowed(String),
     #[error(
