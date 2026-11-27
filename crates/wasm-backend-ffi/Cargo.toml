@@ -1,7 +1,7 @@
 [package]
 name = "wasm-backend-ffi"
 version = "0.1.0"
-license = "BSL-1.0"
+license = "Apache-2.0 WITH LLVM-exception"
 description = "C interface to wasm-backend-core: host hot-reloadable, capability-restricted WebAssembly backend modules from any language that can call C."
 edition = "2024"
 rust-version = "1.90"

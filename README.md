@@ -235,8 +235,9 @@ the Tauri plugin's example app.
 ## License
 
 The repository is licensed under the [Boost Software License 1.0](LICENSE),
-`wasm-backend-ffi` and the hosts included.
-The `wasm-backend-core` crate keeps the license it was published under in
-`tauri-plugin-wasm-backend`, the
+the guests and hosts included.
+The two crates are licensed under the
 [Apache License 2.0 with LLVM Exceptions](crates/wasm-backend-core/LICENSE)
-(`Apache-2.0 WITH LLVM-exception`).
+(`Apache-2.0 WITH LLVM-exception`): `wasm-backend-core` keeps the license it
+was published under in `tauri-plugin-wasm-backend`, and
+[`wasm-backend-ffi`](crates/wasm-backend-ffi/LICENSE) uses the same one.
