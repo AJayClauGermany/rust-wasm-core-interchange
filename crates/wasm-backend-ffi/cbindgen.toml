@@ -1,0 +1,27 @@
+# Generates include/wasm_backend.h. The `header_is_up_to_date` test compares
+# the file with what this produces; run it with `UPDATE_HEADER=1` to rewrite it.
+language = "C"
+include_guard = "WASM_BACKEND_H"
+cpp_compat = true
+documentation_style = "c99"
+header = """/*
+ * C interface to wasm-backend-core: host hot-reloadable, capability-restricted
+ * WebAssembly backend modules from any language that can call C.
+ *
+ * Generated from crates/wasm-backend-ffi/src/lib.rs. Do not edit.
+ *
+ * Strings are NUL-terminated UTF-8 and structured values are JSON. Fallible
+ * functions return a WasmBackendStatus and leave text in their last argument,
+ * `out`: the result on WASM_BACKEND_STATUS_OK (NULL if there is none), the
+ * error message otherwise (with WASM_BACKEND_STATUS_COMMAND, the error value
+ * the module returned, as JSON). Free it with wasm_backend_string_free; pass
+ * NULL for `out` if the text isn't wanted.
+ *
+ * A backend may be used from any thread. Callbacks are called on whichever
+ * thread the work happens on, get strings that are only valid until they
+ * return, and must return normally (no exceptions or longjmp across them).
+ */"""
+
+[enum]
+rename_variants = "ScreamingSnakeCase"
+prefix_with_name = true

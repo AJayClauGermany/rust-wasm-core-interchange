@@ -9,3 +9,6 @@ node_modules/
 /guests/*/*/target
 /guests/*/*/wit/deps
 /guests/*/*/Cargo.lock
+
+# Host build outputs
+__pycache__/
