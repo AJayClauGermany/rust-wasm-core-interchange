@@ -15,7 +15,7 @@ use serde_json::Value;
 
 use crate::{
     Error, Result,
-    capabilities::{Capabilities, Preopen, name_matches},
+    capabilities::{Capabilities, Limits, Preopen, name_matches},
     config::{EngineKind, ExternalConfig, ModuleConfig},
     engine::{self, CommandInfo, ModuleHost, ModuleInstance, StateChanges},
     platform::{BaseDir, Platform, resolve_dir},
@@ -42,7 +42,8 @@ pub type LoadGate<P> =
 
 /// A module about to be loaded or reloaded, as shown to the
 /// [`BackendBuilder::load_gate`] before any of its code is compiled or run.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct LoadRequest<'a> {
     /// Name the module is loaded under.
@@ -179,6 +180,57 @@ pub struct ModuleTrap {
     pub stopped: bool,
 }
 
+/// Why a module is known to the backend but not running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[serde(rename_all = "camelCase")]
+pub enum InactiveReason {
+    /// Switched off: `enabled: false` in its configuration, or
+    /// [`Backend::disable`]. [`Backend::enable`] loads it.
+    Disabled,
+    /// Refused: by the load gate, by the external plugins' `allow` and
+    /// `deny` lists, or because its bytes don't match its `sha256`.
+    Denied,
+    /// It could not be loaded: a missing or invalid file, an import nothing
+    /// provides, ...
+    Failed,
+}
+
+/// A module the backend knows but isn't running, and why: the other half
+/// of [`Backend::modules`]. See [`Backend::inactive`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[serde(rename_all = "camelCase")]
+pub struct InactiveModule {
+    pub name: String,
+    /// File it would be loaded from, if any.
+    pub path: Option<PathBuf>,
+    /// Whether it comes from the external plugins directory.
+    pub external: bool,
+    /// SHA-256 of its bytes in lowercase hex, when they were read.
+    pub sha256: Option<String>,
+    pub reason: InactiveReason,
+    /// The reason in words: the load gate's answer, the load error, ...
+    pub message: String,
+    /// What it would be allowed to do if it ran.
+    pub capabilities: Capabilities,
+}
+
+/// An inactive module, with what is needed to load it after all.
+pub(crate) struct Parked {
+    config: ModuleConfig,
+    /// File whose change retries the load (watched modules that failed).
+    pub(crate) retry: Option<PathBuf>,
+    info: InactiveModule,
+}
+
+/// How far loading a module got.
+#[derive(Default)]
+struct Source {
+    path: Option<PathBuf>,
+    sha256: Option<String>,
+}
+
 /// Metadata, kept apart from the instance so that reading it never waits
 /// for (or deadlocks with) a running call.
 struct Meta {
@@ -299,9 +351,10 @@ pub(crate) struct Inner<P: Platform> {
     typescript_dir: Option<PathBuf>,
     typescript: TypeScriptOptions,
     load_gate: Option<LoadGate<P>>,
+    limits: Limits,
     states: States,
-    /// Modules that failed to load from a file; retried when it changes.
-    pub(crate) pending: Mutex<BTreeMap<String, (ModuleConfig, PathBuf, bool)>>,
+    /// Modules that are known but not running.
+    pub(crate) inactive: Mutex<BTreeMap<String, Parked>>,
     #[cfg(feature = "hot-reload")]
     pub(crate) watcher: Mutex<Option<crate::watcher::Watcher>>,
 }
@@ -468,6 +521,12 @@ fn quoted_list(items: &[impl AsRef<str>]) -> String {
         .join(", ")
 }
 
+/// What is said about an external plugin its `allow` and `deny` lists keep
+/// out.
+fn refused_plugin(name: &str, reason: &str) -> String {
+    format!("loading external plugin `{name}` was refused: {reason}")
+}
+
 /// The SHA-256 of `bytes`, in lowercase hex.
 fn sha256(bytes: &[u8]) -> String {
     use sha2::Digest;
@@ -490,6 +549,7 @@ pub struct BackendBuilder<P: Platform> {
     typescript_dir: Option<PathBuf>,
     typescript: TypeScriptOptions,
     load_gate: Option<LoadGate<P>>,
+    limits: Limits,
     state_store: Option<Arc<dyn StateStore>>,
 }
 
@@ -570,6 +630,14 @@ impl<P: Platform> BackendBuilder<P> {
         self
     }
 
+    /// Resource limits (memory, time per call, restarts) for every module
+    /// that doesn't set its own in its [`Capabilities`]: app modules,
+    /// external plugins and modules loaded at runtime alike.
+    pub fn limits(mut self, limits: Limits) -> Self {
+        self.limits = limits;
+        self
+    }
+
     /// Keep module state (what modules store through `tauri:backend/state`)
     /// in `store`, so it outlives the app: [`FileStateStore`](crate::FileStateStore)
     /// for one JSON file per module, or your own [`StateStore`]. Without
@@ -611,11 +679,12 @@ impl<P: Platform> BackendBuilder<P> {
             typescript_dir: self.typescript_dir,
             typescript: self.typescript,
             load_gate: self.load_gate,
+            limits: self.limits,
             states: States {
                 loaded: Mutex::new(BTreeMap::new()),
                 store: self.state_store,
             },
-            pending: Mutex::new(BTreeMap::new()),
+            inactive: Mutex::new(BTreeMap::new()),
             #[cfg(feature = "hot-reload")]
             watcher: Mutex::new(None),
         })))
@@ -633,6 +702,7 @@ impl<P: Platform> Backend<P> {
             typescript_dir: None,
             typescript: TypeScriptOptions::default(),
             load_gate: None,
+            limits: Limits::default(),
             state_store: None,
         }
     }
@@ -648,8 +718,10 @@ impl<P: Platform> Backend<P> {
     /// start watching files.
     pub fn load_all(&self, modules: impl IntoIterator<Item = (String, ModuleConfig)>) {
         for (name, module) in modules {
-            if let Err(e) = self.load(&name, module) {
-                self.report_error(&name, &e);
+            match self.load(&name, module) {
+                Ok(_) => {}
+                Err(Error::Disabled(_)) => log::info!("WASM module `{name}` is disabled"),
+                Err(e) => self.report_error(&name, &e),
             }
         }
         self.sync_external();
@@ -795,10 +867,106 @@ impl<P: Platform> Backend<P> {
         self.0.states.clear(module).map_err(Error::State)
     }
 
-    /// Information about every loaded module.
+    /// Information about every loaded module. [`Backend::inactive`] lists
+    /// the ones that are not.
     pub fn modules(&self) -> Vec<ModuleInfo> {
         let modules: Vec<_> = self.read_modules().values().cloned().collect();
         modules.iter().map(|m| m.meta().info.clone()).collect()
+    }
+
+    /// Every module the backend knows but isn't running, and why: switched
+    /// off, refused (by the load gate, the external plugins' `allow` and
+    /// `deny` lists or its `sha256`) or failed to load. Together with
+    /// [`Backend::modules`] this is everything that was configured, found
+    /// in the plugins directory or loaded at runtime.
+    ///
+    /// A module leaves the list when it loads ([`Backend::enable`], a
+    /// changed file, the load gate changing its mind), when
+    /// [`Backend::unload`] forgets it, or when an external plugin's file is
+    /// removed.
+    pub fn inactive(&self) -> Vec<InactiveModule> {
+        let parked: Vec<_> = self.parked().values().map(|p| p.info.clone()).collect();
+        // A failed replacement of a module that still runs is not inactive.
+        let modules = self.read_modules();
+        parked
+            .into_iter()
+            .filter(|p| !modules.contains_key(&p.name))
+            .collect()
+    }
+
+    /// Switch a module off: it is unloaded and stays that way, an external
+    /// plugin too, until [`Backend::enable`] is called. Its state is kept.
+    ///
+    /// This lasts as long as the backend. To keep a module off between runs
+    /// of the app, remember the user's choice and set `enabled: false` in
+    /// its configuration (or call this again at startup).
+    pub fn disable(&self, name: &str) -> Result<()> {
+        const MESSAGE: &str = "switched off with `disable`";
+        match self.get(name) {
+            Ok(m) => {
+                let mut config = m.config.clone();
+                config.enabled = Some(false);
+                let info = InactiveModule {
+                    name: name.to_string(),
+                    path: m.path.clone(),
+                    external: m.external,
+                    sha256: Some(m.meta().info.sha256.clone()),
+                    reason: InactiveReason::Disabled,
+                    message: MESSAGE.to_string(),
+                    capabilities: config.capabilities.clone(),
+                };
+                // Parked first, so a scan of the plugins directory running
+                // now doesn't load it again.
+                self.parked().insert(
+                    name.to_string(),
+                    Parked {
+                        config,
+                        retry: None,
+                        info,
+                    },
+                );
+                self.remove(name)
+            }
+            Err(e) => {
+                {
+                    let mut parked = self.parked();
+                    let Some(p) = parked.get_mut(name) else {
+                        return Err(e);
+                    };
+                    p.config.enabled = Some(false);
+                    p.retry = None;
+                    p.info.reason = InactiveReason::Disabled;
+                    p.info.message = MESSAGE.to_string();
+                }
+                #[cfg(feature = "hot-reload")]
+                crate::watcher::sync(self);
+                Ok(())
+            }
+        }
+    }
+
+    /// Load a module that is in [`Backend::inactive`]: one that was switched
+    /// off, or one that was refused or failed and should be tried again
+    /// (e.g. after the user approved it). The load gate is asked as for any
+    /// load. Does nothing for a module that is already loaded.
+    pub fn enable(&self, name: &str) -> Result<ModuleInfo> {
+        let parked = self
+            .parked()
+            .get(name)
+            .map(|p| (p.config.clone(), p.info.external));
+        let Some((mut config, external)) = parked else {
+            return self.module(name);
+        };
+        config.enabled = Some(true);
+        let result = self.load_inner(name, config, external);
+        if let Err(e) = &result {
+            self.report_error(name, e);
+        }
+        result
+    }
+
+    pub(crate) fn parked(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Parked>> {
+        self.0.inactive.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Information about one module.
@@ -832,13 +1000,24 @@ impl<P: Platform> Backend<P> {
         self.load_inner(name, config, false)
     }
 
-    /// Unload a module.
+    /// Unload a module and forget it: it is not listed as inactive either.
+    /// An external plugin whose file is still there is loaded again by the
+    /// next scan of the plugins directory; use [`Backend::disable`] to keep
+    /// one off.
     pub fn unload(&self, name: &str) -> Result<()> {
-        self.0
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(name);
+        let parked = self.parked().remove(name).is_some();
+        match self.remove(name) {
+            Err(_) if parked => {
+                #[cfg(feature = "hot-reload")]
+                crate::watcher::sync(self);
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
+    /// Take a loaded module out of the registry.
+    fn remove(&self, name: &str) -> Result<()> {
         let m = self
             .0
             .modules
@@ -971,10 +1150,18 @@ impl<P: Platform> Backend<P> {
     }
 
     pub(crate) fn get(&self, name: &str) -> Result<Arc<Module<P>>> {
-        self.read_modules()
+        if let Some(m) = self.read_modules().get(name) {
+            return Ok(m.clone());
+        }
+        let disabled = self
+            .parked()
             .get(name)
-            .cloned()
-            .ok_or_else(|| Error::ModuleNotFound(name.to_string()))
+            .is_some_and(|p| p.info.reason == InactiveReason::Disabled);
+        Err(if disabled {
+            Error::Disabled(name.to_string())
+        } else {
+            Error::ModuleNotFound(name.to_string())
+        })
     }
 
     /// Whether the frontend may invoke the module without an explicit scope
@@ -1008,7 +1195,8 @@ impl<P: Platform> Backend<P> {
             );
         }
         let registered: Vec<&String> = self.0.host_commands.keys().collect();
-        for pattern in &caps.host_commands {
+        // `!` entries deny; one that matches nothing takes nothing away.
+        for pattern in caps.host_commands.iter().filter(|p| !p.starts_with('!')) {
             if !registered.iter().any(|c| name_matches(pattern, c)) {
                 warnings.push(if registered.is_empty() {
                     format!("`capabilities.hostCommands` allows `{pattern}`, but the app registers no host commands")
@@ -1034,6 +1222,23 @@ impl<P: Platform> Backend<P> {
         bytes: &[u8],
     ) -> Result<(Box<dyn ModuleInstance>, EngineKind)> {
         let name = request.name;
+        // Here rather than where the plugins directory is scanned, so that
+        // no way of loading a plugin (`enable`, a reload) gets around it.
+        if request.external
+            && let Some(external) = &self.0.external
+            && let Some(reason) = external.config.refusal(name)
+        {
+            return Err(Error::NotAllowed(refused_plugin(name, &reason)));
+        }
+        if let Some(pinned) = &config.sha256
+            && !pinned.trim().eq_ignore_ascii_case(request.sha256)
+        {
+            return Err(Error::NotAllowed(format!(
+                "loading WASM module `{name}` was refused: the SHA-256 of its bytes is {}, not the configured `sha256` ({})",
+                request.sha256,
+                pinned.trim()
+            )));
+        }
         if let Some(gate) = &self.0.load_gate {
             gate(&self.0.platform, request).map_err(|reason| {
                 Error::NotAllowed(format!(
@@ -1055,35 +1260,52 @@ impl<P: Platform> Backend<P> {
     pub(crate) fn load_inner(
         &self,
         name: &str,
-        config: ModuleConfig,
+        mut config: ModuleConfig,
         external: bool,
     ) -> Result<ModuleInfo> {
-        self.0
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(name);
-        let watch = config.watch.unwrap_or(self.0.hot_reload);
-        let retry = (watch && config.bytes.is_none())
-            .then(|| {
-                config
-                    .configured_path(self.0.dev)
-                    .map(|p| self.resolve_module_path(p, external))
-            })
-            .flatten()
-            .and_then(Result::ok)
-            .map(|path| (config.clone(), path));
-        let result = self.try_load(name, config, external);
-        if result.is_err()
-            && let Some((config, path)) = retry
-        {
-            // Retry when the file shows up or changes (e.g. after a build).
-            self.0
-                .pending
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(name.to_string(), (config, path, external));
-            #[cfg(feature = "hot-reload")]
+        config.capabilities.apply_limits(&self.0.limits);
+        let mut source = Source::default();
+        let result = self.try_load(name, &config, external, &mut source);
+        match &result {
+            Ok(_) => {
+                self.parked().remove(name);
+            }
+            Err(error) => {
+                let reason = match error {
+                    Error::Disabled(_) => InactiveReason::Disabled,
+                    Error::NotAllowed(_) => InactiveReason::Denied,
+                    _ => InactiveReason::Failed,
+                };
+                let message = match reason {
+                    InactiveReason::Disabled => "`enabled` is `false`".to_string(),
+                    _ => error.to_string(),
+                };
+                // Retry when the file shows up or changes (e.g. after a build).
+                let watch = config.watch.unwrap_or(self.0.hot_reload);
+                let retry = (watch && reason != InactiveReason::Disabled)
+                    .then(|| source.path.clone())
+                    .flatten();
+                let info = InactiveModule {
+                    name: name.to_string(),
+                    path: source.path,
+                    external,
+                    sha256: source.sha256,
+                    reason,
+                    message,
+                    capabilities: config.capabilities.clone(),
+                };
+                self.parked().insert(
+                    name.to_string(),
+                    Parked {
+                        config,
+                        retry,
+                        info,
+                    },
+                );
+            }
+        }
+        #[cfg(feature = "hot-reload")]
+        if result.is_err() {
             crate::watcher::sync(self);
         }
         result
@@ -1093,13 +1315,11 @@ impl<P: Platform> Backend<P> {
     #[cfg_attr(not(feature = "hot-reload"), allow(dead_code))]
     pub(crate) fn retry_pending(&self, name: &str) {
         let entry = self
-            .0
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .parked()
             .get(name)
-            .cloned();
-        if let Some((config, _, external)) = entry
+            .filter(|p| p.retry.is_some())
+            .map(|p| (p.config.clone(), p.info.external));
+        if let Some((config, external)) = entry
             && let Err(e) = self.load_inner(name, config, external)
         {
             self.report_error(name, &e);
@@ -1124,7 +1344,13 @@ impl<P: Platform> Backend<P> {
         }
     }
 
-    fn try_load(&self, name: &str, config: ModuleConfig, external: bool) -> Result<ModuleInfo> {
+    fn try_load(
+        &self,
+        name: &str,
+        config: &ModuleConfig,
+        external: bool,
+        source: &mut Source,
+    ) -> Result<ModuleInfo> {
         let load_err = |message: String| Error::Load {
             module: name.to_string(),
             message,
@@ -1136,20 +1362,26 @@ impl<P: Platform> Backend<P> {
                 )));
             }
         }
-        let (bytes, path): (Arc<[u8]>, Option<PathBuf>) =
-            match (&config.bytes, config.configured_path(self.0.dev)) {
-                (Some(bytes), _) => (bytes.clone(), None),
-                (None, Some(path)) => {
-                    let path = self.resolve_module_path(path, external)?;
-                    let bytes = std::fs::read(&path)
-                        .map_err(|e| load_err(format!("can't read {}: {e}", path.display())))?;
-                    (bytes.into(), Some(path))
-                }
-                (None, None) => return Err(load_err("no `path` configured".into())),
-            };
+        let path = match (&config.bytes, config.configured_path(self.0.dev)) {
+            (Some(_), _) => None,
+            (None, Some(path)) => Some(self.resolve_module_path(path, external)?),
+            (None, None) => return Err(load_err("no `path` configured".into())),
+        };
+        source.path = path.clone();
+        if config.enabled == Some(false) {
+            return Err(Error::Disabled(name.to_string()));
+        }
+        let bytes: Arc<[u8]> = match (&config.bytes, &path) {
+            (Some(bytes), _) => bytes.clone(),
+            (None, Some(path)) => std::fs::read(path)
+                .map_err(|e| load_err(format!("can't read {}: {e}", path.display())))?
+                .into(),
+            (None, None) => unreachable!("a module without bytes has a path"),
+        };
 
         let started = SystemTime::now();
         let hash = sha256(&bytes);
+        source.sha256 = Some(hash.clone());
         let (instance, kind) = self.instantiate(
             &LoadRequest {
                 name,
@@ -1159,7 +1391,7 @@ impl<P: Platform> Backend<P> {
                 capabilities: &config.capabilities,
                 reload: false,
             },
-            &config,
+            config,
             &bytes,
         )?;
         let watched = path.is_some() && config.watch.unwrap_or(self.0.hot_reload);
@@ -1193,7 +1425,7 @@ impl<P: Platform> Backend<P> {
             }),
             instance: Mutex::new(instance),
             listeners: Mutex::new(Vec::new()),
-            config,
+            config: config.clone(),
             path,
         });
         self.subscribe(&module);
@@ -1228,7 +1460,8 @@ impl<P: Platform> Backend<P> {
     }
 
     /// Load new plugins from the external plugins directory and unload the
-    /// ones whose file was removed.
+    /// ones whose file was removed. Plugins that were refused or failed
+    /// before are tried again; disabled ones are left alone.
     pub fn sync_external(&self) {
         let Some(ext) = &self.0.external else { return };
         if let Err(e) = std::fs::create_dir_all(&ext.dir) {
@@ -1252,27 +1485,32 @@ impl<P: Platform> Backend<P> {
                         continue;
                     };
                     present.push(name.clone());
-                    match self.get(&name) {
-                        Ok(m) if !m.external() => {
-                            log::warn!(
-                                "ignoring external plugin {}: an app module named `{name}` exists",
-                                path.display()
-                            );
-                        }
-                        Ok(_) => {}
-                        Err(_) => {
-                            let config = ModuleConfig {
-                                path: Some(path.clone()),
-                                dev_path: Some(path.clone()),
-                                engine: ext.config.engine,
-                                capabilities: ext.config.capabilities.clone(),
-                                expose: Some(ext.config.expose),
-                                ..Default::default()
-                            };
-                            if let Err(e) = self.load_inner(&name, config, true) {
-                                self.report_error(&name, &e);
+                    // What the name stands for already: `(external, settled)`,
+                    // settled being loaded or switched off.
+                    let known = match self.read_modules().get(&name) {
+                        Some(m) => Some((m.external(), true)),
+                        None => self
+                            .parked()
+                            .get(&name)
+                            .map(|p| (p.info.external, p.info.reason == InactiveReason::Disabled)),
+                    };
+                    match known {
+                        Some((false, _)) => log::warn!(
+                            "ignoring external plugin {}: an app module named `{name}` exists",
+                            path.display()
+                        ),
+                        Some((true, true)) => {}
+                        // New, or refused or failed before: try (again).
+                        _ => match ext.config.refusal(&name) {
+                            Some(reason) => self.park_refused(&name, &path, &ext.config, reason),
+                            None => {
+                                let config = ext.config.module(&name, &path);
+                                match self.load_inner(&name, config, true) {
+                                    Ok(_) | Err(Error::Disabled(_)) => {}
+                                    Err(e) => self.report_error(&name, &e),
+                                }
                             }
-                        }
+                        },
                     }
                 }
             }
@@ -1287,6 +1525,38 @@ impl<P: Platform> Backend<P> {
         for name in gone {
             let _ = self.unload(&name);
         }
+        self.parked()
+            .retain(|name, p| !p.info.external || present.contains(name));
+    }
+
+    /// List an external plugin the `allow` and `deny` lists keep out, without
+    /// reading more of it than its hash.
+    fn park_refused(&self, name: &str, path: &Path, external: &ExternalConfig, reason: String) {
+        let message = refused_plugin(name, &reason);
+        let mut parked = self.parked();
+        if parked.get(name).is_some_and(|p| p.info.message == message) {
+            return;
+        }
+        log::info!("{message}");
+        let mut config = external.module(name, path);
+        config.capabilities.apply_limits(&self.0.limits);
+        let info = InactiveModule {
+            name: name.to_string(),
+            path: Some(path.to_path_buf()),
+            external: true,
+            sha256: std::fs::read(path).ok().map(|bytes| sha256(&bytes)),
+            reason: InactiveReason::Denied,
+            message,
+            capabilities: config.capabilities.clone(),
+        };
+        parked.insert(
+            name.to_string(),
+            Parked {
+                config,
+                retry: None,
+                info,
+            },
+        );
     }
 
     /// Forward subscribed app events to the module.

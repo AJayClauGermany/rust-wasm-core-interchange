@@ -98,16 +98,18 @@ mod task;
 mod watcher;
 
 pub use capabilities::{
-    Capabilities, EventCapabilities, Preopen, WasiCapabilities, name_matches, wildcard_match,
+    Capabilities, EventCapabilities, Limits, Preopen, WasiCapabilities, name_matches,
+    wildcard_match,
 };
-pub use config::{Config, EngineKind, ExternalConfig, ModuleConfig};
+pub use config::{Config, EngineKind, ExternalConfig, ExternalPluginConfig, ModuleConfig};
 pub use engine::{CommandInfo, ParamInfo};
 pub use error::{Error, Result};
 pub use platform::{BaseDir, EventBus, EventHandler, Platform, resolve_dir};
 pub use registry::{
     Backend, BackendBuilder, EVENT_MODULE_ERROR, EVENT_MODULE_LOADED, EVENT_MODULE_RELOADED,
-    EVENT_MODULE_TRAPPED, EVENT_MODULE_UNLOADED, HostCall, HostCommandFn, LoadGate, LoadRequest,
-    ModuleError, ModuleInfo, ModuleTrap, TypeScriptOptions, host_command_fn,
+    EVENT_MODULE_TRAPPED, EVENT_MODULE_UNLOADED, HostCall, HostCommandFn, InactiveModule,
+    InactiveReason, LoadGate, LoadRequest, ModuleError, ModuleInfo, ModuleTrap, TypeScriptOptions,
+    host_command_fn,
 };
 
 pub use state::{FileStateStore, STATE_KEY_MAX, STATE_VALUE_MAX, StateStore};
