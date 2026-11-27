@@ -7,24 +7,45 @@
 #[path = "../../wasm-backend-core/tests/common/mod.rs"]
 mod common;
 
-use std::{path::PathBuf, process::Command};
+use std::{
+    path::PathBuf,
+    process::{Command, Stdio},
+    sync::OnceLock,
+};
 
-/// The shared library cargo built for these tests, next to the test binary.
+/// The shared library, built the way a host's developer builds it. Cargo
+/// builds one for these tests too, but doesn't say where it put it, and
+/// that differs between Cargo versions; its build messages do say.
 fn library() -> PathBuf {
-    let name = if cfg!(windows) {
-        "wasm_backend.dll"
-    } else if cfg!(target_os = "macos") {
-        "libwasm_backend.dylib"
-    } else {
-        "libwasm_backend.so"
-    };
-    let path = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join(name);
-    assert!(path.exists(), "{} was not built", path.display());
-    path
+    static LIBRARY: OnceLock<PathBuf> = OnceLock::new();
+    LIBRARY
+        .get_or_init(|| {
+            let mut build = Command::new(env!("CARGO"));
+            build
+                .args(["build", "--lib", "--message-format=json", "--manifest-path"])
+                .arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
+                .stderr(Stdio::inherit());
+            if !cfg!(debug_assertions) {
+                build.arg("--release");
+            }
+            let output = build.output().expect("failed to run cargo");
+            assert!(output.status.success(), "failed to build the library");
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|message| {
+                    message["reason"] == "compiler-artifact"
+                        && message["target"]["name"] == "wasm_backend"
+                })
+                .flat_map(|message| message["filenames"].as_array().cloned().unwrap_or_default())
+                .filter_map(|file| file.as_str().map(PathBuf::from))
+                .find(|file| {
+                    file.to_string_lossy()
+                        .ends_with(std::env::consts::DLL_SUFFIX)
+                })
+                .expect("cargo built no shared library")
+        })
+        .clone()
 }
 
 /// The first of `programs` that runs, or `None` (test skipped).

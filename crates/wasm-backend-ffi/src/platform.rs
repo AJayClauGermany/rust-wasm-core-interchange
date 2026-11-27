@@ -147,10 +147,11 @@ mod tests {
 
     #[test]
     fn options_are_the_core_config_plus_dirs() {
+        let data = std::env::temp_dir().join("data");
         let options = Options::parse(json!({
             "modules": { "greeter": { "path": "greeter.wasm" } },
             "limits": { "timeoutMs": 1000 },
-            "dirs": { "appData": "/data" },
+            "dirs": { "appData": data },
             "dev": true
         }))
         .unwrap();
@@ -160,9 +161,9 @@ mod tests {
 
         let platform = FfiPlatform::new(options.dirs, None);
         let dir = |base| platform.base_dir(base).unwrap();
-        assert_eq!(dir(BaseDir::AppData), PathBuf::from("/data"));
+        assert_eq!(dir(BaseDir::AppData), data);
         // Directories that aren't set fall back to sensible ones.
-        assert_eq!(dir(BaseDir::AppCache), PathBuf::from("/data"));
+        assert_eq!(dir(BaseDir::AppCache), data);
         assert_eq!(dir(BaseDir::Resource), std::env::current_dir().unwrap());
         assert_eq!(dir(BaseDir::Temp), std::env::temp_dir());
 
