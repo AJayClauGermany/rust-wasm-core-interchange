@@ -15,14 +15,15 @@ fn header_is_up_to_date() {
         .generate()
         .expect("cbindgen failed")
         .write(&mut generated);
-    let generated = String::from_utf8(generated).unwrap();
+    // Git may check files out with other line endings: the header itself,
+    // and `cbindgen.toml`, whose `header` text ends up in the output.
+    let generated = String::from_utf8(generated).unwrap().replace("\r\n", "\n");
 
     let path = crate_dir.join("include/wasm_backend.h");
     if std::env::var_os("UPDATE_HEADER").is_some() {
         std::fs::write(&path, &generated).unwrap();
         return;
     }
-    // Git may check the file out with other line endings.
     let checked_in = std::fs::read_to_string(&path)
         .unwrap_or_default()
         .replace("\r\n", "\n");
