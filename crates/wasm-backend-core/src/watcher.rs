@@ -43,13 +43,7 @@ pub(crate) fn sync<P: Platform>(backend: &Backend<P>) {
             dirs.insert(parent.to_path_buf());
         }
     }
-    for (_, path, _) in backend
-        .0
-        .pending
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .values()
-    {
+    for path in backend.parked().values().filter_map(|p| p.retry.as_ref()) {
         if let Some(parent) = normalize(path).parent() {
             dirs.insert(parent.to_path_buf());
         }
@@ -146,12 +140,13 @@ fn handle_changes<P: Platform>(backend: &Backend<P>, changed: &HashSet<PathBuf>)
     }
 
     let pending: Vec<String> = backend
-        .0
-        .pending
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .parked()
         .iter()
-        .filter(|(_, (_, path, _))| changed.contains(&normalize(path)) && path.exists())
+        .filter(|(_, p)| {
+            p.retry
+                .as_ref()
+                .is_some_and(|path| changed.contains(&normalize(path)) && path.exists())
+        })
         .map(|(name, _)| name.clone())
         .collect();
     for name in pending {

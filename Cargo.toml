@@ -1,5 +1,5 @@
 [workspace]
 resolver = "3"
-members = ["crates/wasm-backend-core"]
+members = ["crates/wasm-backend-core", "crates/wasm-backend-ffi"]
 # Guests are built for WASM targets by the tests, each as its own workspace.
 exclude = ["guests"]

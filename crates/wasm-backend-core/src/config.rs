@@ -10,7 +10,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::capabilities::Capabilities;
+use crate::capabilities::{Capabilities, Limits, wildcard_match};
 
 /// Which runtime executes a module.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -39,6 +39,10 @@ pub struct Config {
     /// Third-party plugins loaded from a directory at runtime.
     #[serde(default)]
     pub external: Option<ExternalConfig>,
+    /// Resource limits for every module that doesn't set its own, external
+    /// plugins and modules loaded at runtime included.
+    #[serde(default)]
+    pub limits: Limits,
     /// Watch module files and reload them when they change.
     /// Defaults to `true` in debug builds and `false` in release builds.
     #[serde(default)]
@@ -83,6 +87,15 @@ pub struct ModuleConfig {
     /// Override the global hot reload setting for this module.
     #[serde(default)]
     pub watch: Option<bool>,
+    /// `false` keeps the module from being loaded until
+    /// [`Backend::enable`](crate::Backend::enable) is called. It stays
+    /// listed in [`Backend::inactive`](crate::Backend::inactive).
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Only load the module if this is the SHA-256 of its bytes (hex). A
+    /// file with any other content is refused, on reload too.
+    #[serde(default)]
+    pub sha256: Option<String>,
     /// Module bytes, when the module is embedded in the binary instead of
     /// being loaded from disk (see [`ModuleConfig::from_bytes`]).
     #[serde(skip)]
@@ -133,6 +146,19 @@ impl ModuleConfig {
         self
     }
 
+    /// `false` keeps the module from being loaded until
+    /// [`Backend::enable`](crate::Backend::enable) is called.
+    pub fn enabled(mut self, enabled: bool) -> Self {
+        self.enabled = Some(enabled);
+        self
+    }
+
+    /// Only load the module if this is the SHA-256 of its bytes (hex).
+    pub fn sha256(mut self, sha256: impl Into<String>) -> Self {
+        self.sha256 = Some(sha256.into());
+        self
+    }
+
     /// The configured path, unresolved: `dev_path` (falling back to `path`)
     /// in development, `path` otherwise.
     pub fn configured_path(&self, dev: bool) -> Option<&Path> {
@@ -146,7 +172,22 @@ impl ModuleConfig {
 
 /// Third-party plugins: every `*.wasm` file in `dir` is loaded as a module
 /// named after the file stem.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// ```
+/// use wasm_backend_core::{Capabilities, ExternalConfig, ExternalPluginConfig};
+///
+/// let external = ExternalConfig::new("$APPDATA/plugins")
+///     // What every plugin gets...
+///     .capabilities(Capabilities::default().allow_emit("plugin://*"))
+///     // ...and what one of them gets instead.
+///     .plugin(
+///         "weather",
+///         ExternalPluginConfig::default()
+///             .capabilities(Capabilities::default().allow_host("api.weather.example")),
+///     )
+///     .deny("legacy-*");
+/// ```
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ExternalConfig {
     /// Directory to load plugins from. Relative paths are resolved against
@@ -162,4 +203,183 @@ pub struct ExternalConfig {
     /// Engine used for external plugins.
     #[serde(default)]
     pub engine: EngineKind,
+    /// Names of the plugins that may be loaded (`*` wildcards). Empty
+    /// allows every plugin `deny` doesn't match.
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// Names of the plugins that are never loaded (`*` wildcards). Wins
+    /// over `allow`.
+    #[serde(default)]
+    pub deny: Vec<String>,
+    /// Settings for single plugins, by name, replacing the shared ones
+    /// above.
+    #[serde(default)]
+    pub plugins: BTreeMap<String, ExternalPluginConfig>,
+}
+
+/// What one external plugin gets instead of the settings shared by all of
+/// them. Unset fields keep the shared setting.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExternalPluginConfig {
+    /// Capabilities of this plugin, replacing (not adding to) the shared
+    /// ones.
+    #[serde(default)]
+    pub capabilities: Option<Capabilities>,
+    #[serde(default)]
+    pub expose: Option<bool>,
+    #[serde(default)]
+    pub engine: Option<EngineKind>,
+    /// `false` keeps the plugin from being loaded until
+    /// [`Backend::enable`](crate::Backend::enable) is called.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Only load the plugin if this is the SHA-256 of its file (hex).
+    #[serde(default)]
+    pub sha256: Option<String>,
+}
+
+impl ExternalPluginConfig {
+    pub fn capabilities(mut self, capabilities: Capabilities) -> Self {
+        self.capabilities = Some(capabilities);
+        self
+    }
+
+    pub fn expose(mut self, expose: bool) -> Self {
+        self.expose = Some(expose);
+        self
+    }
+
+    pub fn engine(mut self, engine: EngineKind) -> Self {
+        self.engine = Some(engine);
+        self
+    }
+
+    pub fn enabled(mut self, enabled: bool) -> Self {
+        self.enabled = Some(enabled);
+        self
+    }
+
+    pub fn sha256(mut self, sha256: impl Into<String>) -> Self {
+        self.sha256 = Some(sha256.into());
+        self
+    }
+}
+
+impl ExternalConfig {
+    /// Load plugins from `dir`, with no capabilities.
+    pub fn new(dir: impl Into<PathBuf>) -> Self {
+        Self {
+            dir: dir.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Capabilities granted to every plugin.
+    pub fn capabilities(mut self, capabilities: Capabilities) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
+
+    pub fn expose(mut self, expose: bool) -> Self {
+        self.expose = expose;
+        self
+    }
+
+    pub fn engine(mut self, engine: EngineKind) -> Self {
+        self.engine = engine;
+        self
+    }
+
+    /// Only load plugins whose name matches `pattern` (or another allowed
+    /// one).
+    pub fn allow(mut self, pattern: impl Into<String>) -> Self {
+        self.allow.push(pattern.into());
+        self
+    }
+
+    /// Never load plugins whose name matches `pattern`.
+    pub fn deny(mut self, pattern: impl Into<String>) -> Self {
+        self.deny.push(pattern.into());
+        self
+    }
+
+    /// Settings for the plugin called `name`.
+    pub fn plugin(mut self, name: impl Into<String>, config: ExternalPluginConfig) -> Self {
+        self.plugins.insert(name.into(), config);
+        self
+    }
+
+    /// Why the plugin called `name` may not be loaded, if it may not.
+    pub(crate) fn refusal(&self, name: &str) -> Option<String> {
+        if let Some(pattern) = self.deny.iter().find(|p| wildcard_match(p, name)) {
+            return Some(format!("`external.deny` lists `{pattern}`"));
+        }
+        if !self.allow.is_empty() && !self.allow.iter().any(|p| wildcard_match(p, name)) {
+            return Some("`external.allow` doesn't list it".to_string());
+        }
+        None
+    }
+
+    /// The configuration the plugin `name` at `path` is loaded with.
+    pub(crate) fn module(&self, name: &str, path: &Path) -> ModuleConfig {
+        let plugin = self.plugins.get(name).cloned().unwrap_or_default();
+        ModuleConfig {
+            path: Some(path.to_path_buf()),
+            dev_path: Some(path.to_path_buf()),
+            engine: plugin.engine.unwrap_or(self.engine),
+            capabilities: plugin
+                .capabilities
+                .unwrap_or_else(|| self.capabilities.clone()),
+            expose: Some(plugin.expose.unwrap_or(self.expose)),
+            enabled: plugin.enabled,
+            sha256: plugin.sha256,
+            ..Default::default()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn external_plugins_are_allowed_and_denied_by_name() {
+        let open = ExternalConfig::new("plugins").deny("legacy-*");
+        assert_eq!(open.refusal("weather"), None);
+        assert!(open.refusal("legacy-sync").unwrap().contains("`legacy-*`"));
+
+        let closed = ExternalConfig::new("plugins")
+            .allow("official-*")
+            .deny("official-beta");
+        assert_eq!(closed.refusal("official-notes"), None);
+        assert!(closed.refusal("weather").unwrap().contains("allow"));
+        assert!(closed.refusal("official-beta").unwrap().contains("deny"));
+    }
+
+    #[test]
+    fn a_plugin_replaces_the_shared_settings() {
+        let external: ExternalConfig = serde_json::from_value(serde_json::json!({
+            "dir": "plugins",
+            "capabilities": { "events": { "emit": ["plugin://*"] } },
+            "plugins": {
+                "weather": { "capabilities": { "allowedHosts": ["api.weather.example"] }, "expose": true },
+                "notes": { "enabled": false }
+            }
+        }))
+        .unwrap();
+        let path = Path::new("/plugins/x.wasm");
+        let other = external.module("other", path);
+        assert_eq!(other.capabilities.events.emit, ["plugin://*"]);
+        assert_eq!(other.expose, Some(false));
+
+        let weather = external.module("weather", path);
+        assert!(weather.capabilities.events.emit.is_empty());
+        assert_eq!(weather.capabilities.allowed_hosts, ["api.weather.example"]);
+        assert_eq!(weather.expose, Some(true));
+
+        let notes = external.module("notes", path);
+        assert_eq!(notes.enabled, Some(false));
+        assert_eq!(notes.capabilities.events.emit, ["plugin://*"]);
+    }
 }
